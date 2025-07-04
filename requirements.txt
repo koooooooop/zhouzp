@@ -1,0 +1,29 @@
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+numpy>=1.21.0
+pandas>=1.3.0
+scikit-learn>=1.0.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+tqdm>=4.62.0
+tensorboard>=2.8.0
+PyYAML>=6.0
+argparse
+logging
+datetime
+glob2
+warnings
+typing
+concurrent.futures
+json
+os
+sys
+
+# Mamba相关依赖（可选）
+# mamba-ssm>=1.0.0
+# causal-conv1d>=1.0.0
+
+# 如果需要安装mamba-ssm，请运行：
+# pip install mamba-ssm
+# pip install causal-conv1d
