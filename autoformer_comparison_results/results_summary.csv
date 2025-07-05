@@ -1,0 +1,2 @@
+Dataset,Pred_Len,MSE,MAE,RMSE,R2,Training_Time,Model_Params,Best_Val_Loss
+Weather,96,FAILED,FAILED,FAILED,FAILED,FAILED,FAILED,FAILED

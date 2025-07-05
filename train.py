@@ -93,12 +93,21 @@ class M2MOEPTrainer:
             'adaptive_clip_value': self.config['training'].get('gradient_clip', 1.0)
         }
         
+        # 添加梯度裁剪阈值属性
+        self.grad_clip_threshold = self.config['training'].get('gradient_clip', 1.0)
+        
         # 创建保存目录
         self.save_dir = config.get('save_dir', 'checkpoints')
         os.makedirs(self.save_dir, exist_ok=True)
         
         self.logger.info(f"训练器初始化完成，设备: {self.device}")
         self.logger.info(f"模型参数数量: {sum(p.numel() for p in self.model.parameters()):,}")
+        
+        # 训练配置 - 添加默认值
+        train_config = config.get('training', {})
+        self.epochs = train_config.get('epochs', 20)
+        self.batch_size = train_config.get('batch_size', 16)
+        self.learning_rate = train_config.get('learning_rate', 0.001)
     
     def set_seed(self, seed: int):
         """设置随机种子"""
@@ -245,6 +254,53 @@ class M2MOEPTrainer:
         grad_info = [f"{name}: {norm:.4f}" for name, norm in top_layers]
         self.logger.debug(f"梯度范数最大的5层: {'; '.join(grad_info)}")
     
+    def _adaptive_gradient_clipping(self, losses: Dict[str, torch.Tensor]) -> float:
+        """
+        自适应梯度裁剪 - 修复版本
+        :param losses: 损失字典
+        :return: 使用的裁剪阈值
+        """
+        # 计算总梯度范数
+        total_norm = 0.0
+        param_count = 0
+        
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                param_norm = param.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+                param_count += 1
+        
+        total_norm = total_norm ** 0.5
+        
+        # 修复梯度裁剪策略
+        if total_norm > self.grad_clip_threshold:
+            # 不要将阈值降到太低
+            min_threshold = 0.1  # 最小阈值
+            
+            # 根据梯度爆炸严重程度调整
+            if total_norm > 10.0:
+                # 严重梯度爆炸
+                self.grad_clip_threshold = max(min_threshold, self.grad_clip_threshold * 0.5)
+            elif total_norm > 5.0:
+                # 中等梯度爆炸
+                self.grad_clip_threshold = max(min_threshold, self.grad_clip_threshold * 0.8)
+            else:
+                # 轻微梯度爆炸
+                self.grad_clip_threshold = max(min_threshold, self.grad_clip_threshold * 0.9)
+            
+            self.logger.warning(f"检测到梯度爆炸: {total_norm:.4f}")
+            self.logger.info(f"调整梯度裁剪阈值为: {self.grad_clip_threshold:.4f}")
+            
+            # 应用梯度裁剪
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_threshold)
+        
+        else:
+            # 梯度正常时，逐渐恢复阈值
+            if self.grad_clip_threshold < 1.0:
+                self.grad_clip_threshold = min(1.0, self.grad_clip_threshold * 1.01)
+        
+        return self.grad_clip_threshold
+    
     def train_epoch(self) -> Dict[str, float]:
         """训练一个epoch"""
         self.model.train()
@@ -264,7 +320,13 @@ class M2MOEPTrainer:
         num_batches = len(train_loader)
         
         with tqdm(train_loader, desc=f'Epoch {self.current_epoch}') as pbar:
-            for batch_idx, (batch_x, batch_y) in enumerate(pbar):
+            for batch_idx, batch_data in enumerate(pbar):
+                if len(batch_data) == 2:
+                    batch_x, batch_y = batch_data
+                else:
+                    print(f"配置错误: 期望2个值，但得到{len(batch_data)}个")
+                    continue
+                
                 batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
                 
                 # 前向传播
@@ -284,61 +346,67 @@ class M2MOEPTrainer:
                         aux_info['original_input'] = batch_x
                 
                 # 计算损失
-                total_loss, losses = self.criterion(predictions, batch_y, aux_info, reconstructed)
+                losses = self.criterion(
+                    predictions=predictions,
+                    targets=batch_y,
+                    expert_weights=aux_info.get('expert_weights'),
+                    expert_embeddings=aux_info.get('expert_embeddings'),
+                    flow_embeddings=reconstructed,
+                    flow_log_det=aux_info.get('flow_log_det')
+                )
+                total_loss = losses['total']
                 
                 # 反向传播
                 total_loss.backward()
                 
                 # 增强的梯度裁剪和监控
-                # 1. 计算梯度范数
-                total_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), 
-                    float('inf'),  # 先计算真实梯度范数
-                    norm_type=2
-                )
+                # 1. 先计算梯度范数（不进行裁剪）
+                total_grad_norm = 0.0
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        param_norm = param.grad.data.norm(2)
+                        total_grad_norm += param_norm.item() ** 2
+                total_grad_norm = total_grad_norm ** 0.5
                 
                 # 2. 梯度统计和监控
-                self.gradient_stats['grad_norms'].append(total_grad_norm.item())
+                self.gradient_stats['grad_norms'].append(total_grad_norm)
                 self.gradient_stats['max_grad_norm'] = max(
                     self.gradient_stats['max_grad_norm'], 
-                    total_grad_norm.item()
+                    total_grad_norm
                 )
                 
                 # 3. 检查梯度异常
-                if torch.isnan(total_grad_norm) or torch.isinf(total_grad_norm):
+                if torch.isnan(torch.tensor(total_grad_norm)) or torch.isinf(torch.tensor(total_grad_norm)):
                     self.logger.warning(f"梯度范数异常: {total_grad_norm}")
                     # 跳过这个batch的参数更新
                     self.optimizer.zero_grad()
                     continue
                 
-                # 4. 自适应梯度裁剪
-                clip_value = self.gradient_stats['adaptive_clip_value']
-                
-                # 如果梯度范数过大，动态调整裁剪阈值
-                if total_grad_norm > clip_value * 2:
-                    # 梯度爆炸检测
-                    self.logger.warning(f"检测到梯度爆炸: {total_grad_norm:.4f}")
-                    self.gradient_stats['grad_clip_count'] += 1
-                    
-                    # 动态调整裁剪值
-                    if self.gradient_stats['grad_clip_count'] > 5:
-                        self.gradient_stats['adaptive_clip_value'] = min(
-                            self.gradient_stats['adaptive_clip_value'] * 0.8,
-                            0.1
-                        )
-                        self.logger.info(f"调整梯度裁剪阈值为: {self.gradient_stats['adaptive_clip_value']:.4f}")
-                        self.gradient_stats['grad_clip_count'] = 0
-                
-                # 5. 执行梯度裁剪
+                # 4. 自适应梯度裁剪 - 🔧 关键修复：先裁剪再统计
+                clip_value = self.grad_clip_threshold
                 if total_grad_norm > clip_value:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), 
-                        clip_value
-                    )
-                
-                # 6. 逐层梯度检查（可选，仅在调试时启用）
-                if self.current_epoch < 5 and batch_idx % 100 == 0:
-                    self._check_layer_gradients()
+                    # 计算裁剪因子
+                    clip_factor = clip_value / (total_grad_norm + 1e-6)
+                    
+                    # 应用梯度裁剪
+                    for param in self.model.parameters():
+                        if param.grad is not None:
+                            param.grad.data.mul_(clip_factor)
+                    
+                    # 更新裁剪阈值
+                    if total_grad_norm > 10.0:
+                        self.grad_clip_threshold = max(0.1, self.grad_clip_threshold * 0.5)
+                    elif total_grad_norm > 5.0:
+                        self.grad_clip_threshold = max(0.1, self.grad_clip_threshold * 0.8)
+                    else:
+                        self.grad_clip_threshold = max(0.1, self.grad_clip_threshold * 0.9)
+                    
+                    self.logger.warning(f"梯度裁剪: {total_grad_norm:.4f} -> {clip_value:.4f}")
+                    self.gradient_stats['grad_clip_count'] += 1
+                else:
+                    # 梯度正常时，逐渐恢复阈值
+                    if self.grad_clip_threshold < 1.0:
+                        self.grad_clip_threshold = min(1.0, self.grad_clip_threshold * 1.01)
                 
                 self.optimizer.step()
                 
@@ -414,7 +482,15 @@ class M2MOEPTrainer:
                         aux_info['original_input'] = batch_x
                 
                 # 计算损失
-                total_loss, losses = self.criterion(predictions, batch_y, aux_info, reconstructed)
+                losses = self.criterion(
+                    predictions=predictions,
+                    targets=batch_y,
+                    expert_weights=aux_info.get('expert_weights'),
+                    expert_embeddings=aux_info.get('expert_embeddings'),
+                    flow_embeddings=reconstructed,
+                    flow_log_det=aux_info.get('flow_log_det')
+                )
+                total_loss = losses['total']
                 
                 # 累积损失
                 for key, loss in losses.items():

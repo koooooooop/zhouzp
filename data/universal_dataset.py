@@ -48,12 +48,17 @@ class UniversalDataModule:
         self.config = config
         self.for_pretraining = for_pretraining
         
-        # 数据配置
-        data_config = config['data']
-        self.data_path = data_config['data_path']
-        self.seq_len = data_config['seq_len']
-        self.pred_len = data_config['pred_len']
-        self.batch_size = data_config['batch_size']
+        # 数据配置 - 添加防护性配置读取
+        data_config = config.get('data', {})
+        training_config = config.get('training', {})
+        
+        # 基础数据配置
+        self.data_path = data_config.get('data_path', 'synthetic')
+        self.seq_len = data_config.get('seq_len', 96)
+        self.pred_len = data_config.get('pred_len', 96)
+        
+        # 批处理配置 - 优先从data读取，后备从training读取
+        self.batch_size = data_config.get('batch_size', training_config.get('batch_size', 16))
         self.num_workers = data_config.get('num_workers', 2)
         self.pin_memory = data_config.get('pin_memory', True)
         self.train_ratio = data_config.get('train_ratio', 0.7)

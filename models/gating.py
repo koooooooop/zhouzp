@@ -55,26 +55,23 @@ class GatingEncoder(nn.Module):
     
     def forward(self, z_latent, use_gate_network=False):
         """
-        前向传播
-        :param z_latent: 潜在表示 [B, latent_dim]
-        :param use_gate_network: 是否使用传统门控网络（可选）
-        :return: 专家权重 [B, num_experts]
+        前向传播 - 严格按照文档的可学习专家原型设计
         """
         batch_size = z_latent.size(0)
         
+        # 按文档设计：默认使用基于原型距离的门控
         if use_gate_network:
-            # 传统MLP门控策略
+            # 传统MLP门控策略（保留作为备选）
             return self.gate_network(z_latent)
         else:
-            # 基于原型距离的门控策略（默认）
-            # 生成嵌入向量
-            embedding = self.embedding_network(z_latent)  # [B, embedding_dim]
+            # 基于原型距离的门控策略（文档核心设计）
+            embedding = self.embedding_network(z_latent)
             
-            # 计算与专家原型的距离
+            # 计算与专家原型的距离（文档Algorithm 1 Line 8-9）
             distances = torch.cdist(
-                embedding.unsqueeze(1),  # [B, 1, embedding_dim]
-                self.expert_prototypes.unsqueeze(0)  # [1, num_experts, embedding_dim]
-            ).squeeze(1)  # [B, num_experts]
+                embedding.unsqueeze(1),
+                self.expert_prototypes.unsqueeze(0)
+            ).squeeze(1)
             
             # 返回负距离（距离越小，权重越大）
             return -distances

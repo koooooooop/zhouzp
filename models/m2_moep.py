@@ -1,804 +1,719 @@
+#!/usr/bin/env python3
+"""
+M²-MOEP: Multi-scale Multi-expert Orthogonal Embedding Predictor
+基于FFT+ms-Mamba的多尺度多专家时序预测模型
+"""
+
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.init import xavier_uniform_, constant_
+from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+
 from .expert import FFTmsMambaExpert
-from .gating import GatingEncoder
-from .flow import PowerfulNormalizingFlow
+from .flow import SimpleStableFlow as FlowModel
 
 
 class M2_MOEP(nn.Module):
     """
-    M²-MOEP: Mamba-Metric Mixture of Experts Predictor
+    M²-MOEP主模型
     
-    核心特性：
-    - 预训练的Flow模型进行潜在表示映射
-    - 基于度量学习的门控机制（接受潜在表示）
-    - FFT+ms-Mamba专家网络（早期融合）
-    - 基于预测性能的Triplet Loss
-    - 端到端训练
+    架构组成：
+    1. 输入嵌入层 (Input Embedding)
+    2. 位置编码 (Positional Encoding)
+    3. 多专家网络 (Multi-Expert Network with FFT+ms-Mamba)
+    4. 专家路由器 (Expert Router)
+    5. 温度调度器 (Temperature Scheduler)
+    6. 多尺度特征融合 (Multi-scale Feature Fusion)
+    7. 预测头 (Prediction Head)
     """
     
     def __init__(self, config: Dict):
-        super().__init__()
+        super(M2_MOEP, self).__init__()
         
-        # 基础配置
         self.config = config
-        self.input_dim = config['model']['input_dim']
-        self.hidden_dim = config['model']['hidden_dim']
-        self.output_dim = config['model']['output_dim']
-        self.num_experts = config['model']['num_experts']
-        self.seq_len = config['model']['seq_len']
-        self.pred_len = config['model']['pred_len']
+        self.model_config = config['model']
+        self.training_config = config.get('training', {})
         
-        # Flow模型配置
-        flow_config = config['model'].get('flow', {})
-        self.flow_latent_dim = flow_config.get('latent_dim', 256)
-        self.use_pretrained_flow = flow_config.get('use_pretrained', True)
+        # 基础参数
+        self.input_dim = self.model_config['input_dim']
+        self.hidden_dim = self.model_config['hidden_dim']
+        self.output_dim = self.model_config['output_dim']
+        self.num_experts = self.model_config['num_experts']
+        self.seq_len = self.model_config['seq_len']
+        self.pred_len = self.model_config['pred_len']
+        self.embedding_dim = self.model_config.get('embedding_dim', self.hidden_dim)
         
-        # 专家多样性配置
-        self.diversity_config = config['model'].get('diversity', {})
-        self.prototype_dim = self.diversity_config.get('prototype_dim', 64)
-        self.num_prototypes = self.diversity_config.get('num_prototypes', self.num_experts * 2)
-        self.diversity_weight = self.diversity_config.get('diversity_weight', 0.1)
-        self.force_diversity = self.diversity_config.get('force_diversity', True)
+        # 设备管理
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # 温度调度配置
-        temp_config = config['model'].get('temperature', {})
-        self.initial_temperature = temp_config.get('initial', 1.0)
-        self.min_temperature = temp_config.get('min', 0.1)
-        self.max_temperature = temp_config.get('max', 10.0)
-        self.temperature_decay = temp_config.get('decay', 0.95)
-        self.temperature_schedule = temp_config.get('schedule', 'exponential')
+        # 构建模型组件
+        self._build_model()
         
-        # 可学习的log温度参数
-        self.log_temperature = nn.Parameter(torch.log(torch.tensor(self.initial_temperature)))
+        # 初始化温度调度器
+        self._init_temperature_scheduler()
         
-        # === 核心组件 ===
-        # 1. Flow模型（用于潜在表示映射）
-        flow_input_dim = self.seq_len * self.input_dim  # 展平后的输入维度
-        self.flow_model = PowerfulNormalizingFlow(
-            input_dim=flow_input_dim,
-            latent_dim=self.flow_latent_dim,
-            hidden_dim=self.hidden_dim,
-            num_coupling_layers=6
+        # 初始化损失统计
+        self._init_loss_stats()
+        
+        # 模型参数初始化
+        self._init_weights()
+        
+        print(f"✅ M²-MOEP模型初始化完成")
+        print(f"   - 输入维度: {self.input_dim}")
+        print(f"   - 隐藏维度: {self.hidden_dim}")
+        print(f"   - 专家数量: {self.num_experts}")
+        print(f"   - 总参数量: {sum(p.numel() for p in self.parameters()):,}")
+    
+    def _build_model(self):
+        """构建模型架构 - 🔧 按照M²-MOEP文档重新设计"""
+        
+        # 1. 预训练的流式模型（核心组件）
+        flow_config = self.model_config.get('flow', {})
+        self.flow_model = FlowModel(
+            input_dim=self.input_dim * self.seq_len,  # 扁平化输入
+            flow_layers=flow_config.get('num_layers', 2)
         )
         
-        # 2. 门控网络（接受潜在表示）
-        # 直接传递原配置，避免路径不一致问题
-        self.gating = GatingEncoder(config)
-        
-        # 3. 专家网络（FFT+ms-Mamba）
-        self.experts = nn.ModuleList([
-            FFTmsMambaExpert(config) for _ in range(self.num_experts)
-        ])
-        
-        # === Triplet Loss 组件 ===
-        # 三元组损失配置
-        triplet_config = config['model'].get('triplet', {})
-        self.triplet_margin = triplet_config.get('margin', 0.5)
-        self.triplet_mining_strategy = triplet_config.get('mining_strategy', 'batch_hard')
-        self.triplet_loss_weight = triplet_config.get('loss_weight', 1.0)
-        
-        # 专家性能追踪（用于三元组挖掘）
-        self.expert_performance_history = {}
-        self.performance_window_size = triplet_config.get('performance_window', 100)
-        
-        # 原型分离组件
-        self.prototype_projector = nn.Linear(self.prototype_dim, self.prototype_dim)
-        self.prototypes = nn.Parameter(torch.randn(self.num_prototypes, self.prototype_dim))
-        nn.init.xavier_uniform_(self.prototypes)
-        
-        # 专家特征提取器（用于多样性计算）
-        # 输入维度：7个特征类型 * input_dim（动态计算，不硬编码）
-        expert_feature_input_dim = 7 * self.input_dim
-        self.expert_feature_extractor = nn.Sequential(
-            nn.Linear(expert_feature_input_dim, self.hidden_dim),
+        # 2. 度量学习门控网络（孪生编码器）
+        self.gating_encoder = nn.Sequential(
+            nn.Linear(self.input_dim * self.seq_len, self.embedding_dim),
+            nn.LayerNorm(self.embedding_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(self.hidden_dim, self.prototype_dim),
-            nn.LayerNorm(self.prototype_dim)
+            nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.LayerNorm(self.embedding_dim),
+            nn.ReLU(),
+            nn.Linear(self.embedding_dim, 128)  # 嵌入向量维度
         )
         
-        # 辅助损失权重
-        self.aux_loss_weight = config['training'].get('aux_loss_weight', 0.01)
-        
-        # 训练状态
-        self.training_step = 0
-        self.current_epoch = 0
-    
-    @property
-    def temperature(self):
-        """动态温度属性，确保在合理范围内"""
-        temp = torch.exp(self.log_temperature)
-        return torch.clamp(temp, self.min_temperature, self.max_temperature)
-    
-    @temperature.setter
-    def temperature(self, value):
-        """设置温度值"""
-        # 确保值在合理范围内
-        value = max(self.min_temperature, min(self.max_temperature, value))
-        # 更新log_temperature参数
-        self.log_temperature.data = torch.log(torch.tensor(value))
-    
-    def update_temperature_schedule(self, epoch, expert_entropy):
-        """
-        改进的温度调度策略
-        基于专家使用熵的自适应调整，更加稳健
-        """
-        # 确保expert_entropy在正确的设备上
-        if isinstance(expert_entropy, torch.Tensor):
-            device = expert_entropy.device
-        else:
-            device = self.log_temperature.device
-            expert_entropy = torch.tensor(expert_entropy, device=device)
-        
-        # 数值稳定性检查
-        if torch.isnan(expert_entropy) or torch.isinf(expert_entropy):
-            print(f"警告: 专家熵值异常 {expert_entropy}，使用默认值")
-            expert_entropy = torch.log(torch.tensor(float(self.num_experts), device=device)) * 0.7
-        
-        # 计算归一化熵（0-1范围）
-        max_entropy = torch.log(torch.tensor(float(self.num_experts), device=device))
-        normalized_entropy = torch.clamp(expert_entropy / max_entropy, 0.0, 1.0)
-        
-        # 基于epoch的基础温度衰减（更温和）
-        epoch_factor = max(0.5, 1.0 - epoch * 0.008)  # 从1.0缓慢衰减到0.5
-        
-        # 基于熵的自适应因子
-        if normalized_entropy < 0.4:  # 专家使用过于集中
-            entropy_factor = 1.8  # 提高温度，增加探索
-        elif normalized_entropy < 0.6:  # 轻微不均衡
-            entropy_factor = 1.3
-        elif normalized_entropy > 0.9:  # 过于分散，可能影响性能
-            entropy_factor = 0.8  # 降低温度，增加确定性
-        else:  # 理想范围 [0.6, 0.9]
-            entropy_factor = 1.0  # 保持当前温度
-        
-        # 计算新温度
-        new_temperature = self.initial_temperature * epoch_factor * entropy_factor
-        new_temperature = torch.clamp(
-            torch.tensor(new_temperature, device=device),
-            self.min_temperature, 
-            self.max_temperature
+        # 3. 可学习的专家原型（关键创新）
+        self.expert_prototypes = nn.Parameter(
+            torch.randn(self.num_experts, 128) * 0.01  # 小初始化
         )
         
-        # 使用指数移动平均平滑温度变化
-        current_temp = torch.exp(self.log_temperature)
-        smoothed_temp = 0.9 * current_temp + 0.1 * new_temperature
-        
-        # 数值稳定性检查
-        if torch.isnan(smoothed_temp) or torch.isinf(smoothed_temp):
-            print("警告: 温度计算异常，保持当前温度")
-            return
-        
-        # 更新log_temperature参数
-        self.log_temperature.data = torch.log(smoothed_temp)
-    
-    def compute_expert_features(self, x: torch.Tensor) -> torch.Tensor:
-        """计算更丰富的专家特征用于多样性分析"""
-        batch_size, seq_len, input_dim = x.shape
-        
-        # 1. 统计特征
-        x_mean = x.mean(dim=1)        # [batch_size, input_dim]
-        x_std = x.std(dim=1)          # [batch_size, input_dim]
-        x_min = x.min(dim=1)[0]       # [batch_size, input_dim]
-        x_max = x.max(dim=1)[0]       # [batch_size, input_dim]
-        
-        # 2. 时序特征
-        # 计算一阶差分（变化率） - 兼容性改进
-        try:
-            # 尝试使用torch.diff（PyTorch >= 1.9）
-            x_diff = torch.diff(x, dim=1)  # [batch_size, seq_len-1, input_dim]
-        except AttributeError:
-            # 手动实现差分（兼容旧版本）
-            x_diff = x[:, 1:, :] - x[:, :-1, :]  # [batch_size, seq_len-1, input_dim]
-        
-        x_diff_mean = x_diff.mean(dim=1)  # [batch_size, input_dim]
-        
-        # 计算趋势（线性回归斜率近似）
-        time_steps = torch.arange(seq_len, device=x.device, dtype=x.dtype).view(1, -1, 1)
-        time_steps = time_steps.expand(batch_size, seq_len, input_dim)
-        
-        # 简化的趋势计算：最后值与第一值的差除以时间长度
-        x_trend = (x[:, -1, :] - x[:, 0, :]) / seq_len  # [batch_size, input_dim]
-        
-        # 3. 频域特征（简化）
-        fft_x = torch.fft.fft(x, dim=1)
-        x_magnitude_mean = torch.abs(fft_x).mean(dim=1)  # [batch_size, input_dim]
-        
-        # 4. 组合所有特征
-        combined_features = torch.cat([
-            x_mean, x_std, x_min, x_max,  # 统计特征
-            x_diff_mean, x_trend,          # 时序特征
-            x_magnitude_mean               # 频域特征
-        ], dim=1)  # [batch_size, 7*input_dim]
-        
-        # 5. 降维投影
-        expert_features = self.expert_feature_extractor(combined_features)
-        
-        return expert_features
-    
-    def _validate_intermediate_tensors(self, tensors_dict: Dict[str, torch.Tensor], expected_shapes: Dict[str, tuple]):
-        """验证中间张量的维度和数值稳定性"""
-        for name, tensor in tensors_dict.items():
-            if name in expected_shapes:
-                expected_shape = expected_shapes[name]
-                if tensor.shape != expected_shape:
-                    raise ValueError(f"{name}维度不匹配: 期望{expected_shape}，实际{tensor.shape}")
-            
-            # 数值稳定性检查
-            if torch.isnan(tensor).any():
-                raise ValueError(f"{name}包含NaN值")
-            
-            if torch.isinf(tensor).any():
-                raise ValueError(f"{name}包含Inf值")
-            
-            # 检查数值范围
-            if tensor.abs().max() > 1e6:
-                print(f"警告: {name}数值过大 (max: {tensor.abs().max().item():.2e})")
-    
-    def compute_prototype_separation_loss(self, expert_features: torch.Tensor, 
-                                        expert_weights: torch.Tensor) -> torch.Tensor:
-        """
-        改进的原型分离损失 - 使用对比学习策略
-        目标：确保不同专家的原型在特征空间中分离
-        """
-        batch_size = expert_features.size(0)
-        
-        # 边界条件检查
-        if batch_size == 0:
-            return torch.tensor(0.0, device=expert_features.device)
-        
-        # 1. 投影到原型空间
-        projected_features = self.prototype_projector(expert_features)  # [batch_size, prototype_dim]
-        
-        # 2. 计算样本与所有原型的相似度
-        prototype_similarities = F.cosine_similarity(
-            projected_features.unsqueeze(1),  # [batch_size, 1, prototype_dim]
-            self.prototypes.unsqueeze(0),     # [1, num_prototypes, prototype_dim]
-            dim=2
-        )  # [batch_size, num_prototypes]
-        
-        # 3. 基于专家权重确定目标原型分配
-        # 使用专家权重作为软目标
-        target_expert = torch.argmax(expert_weights, dim=1)  # [batch_size]
-        
-        # 每个专家对应的原型范围 - 确保至少每个专家有一个原型
-        prototypes_per_expert = max(1, self.num_prototypes // self.num_experts)
-        
-        # 4. 计算原型分离损失
-        separation_losses = []
-        
-        for expert_id in range(self.num_experts):
-            # 当前专家的样本mask
-            expert_mask = (target_expert == expert_id)
-            if not expert_mask.any():
-                continue
-            
-            # 当前专家对应的原型索引 - 动态调整范围
-            start_idx = expert_id * prototypes_per_expert
-            end_idx = min(start_idx + prototypes_per_expert, self.num_prototypes)
-            
-            # 如果原型不足，使用剩余的原型
-            if start_idx >= self.num_prototypes:
-                start_idx = expert_id % self.num_prototypes
-                end_idx = start_idx + 1
-            elif start_idx >= end_idx:
-                end_idx = start_idx + 1
-                if end_idx > self.num_prototypes:
-                    start_idx = self.num_prototypes - 1
-                    end_idx = self.num_prototypes
-            
-            # 当前专家的样本
-            expert_samples = projected_features[expert_mask]  # [num_samples, prototype_dim]
-            expert_similarities = prototype_similarities[expert_mask]  # [num_samples, num_prototypes]
-            
-            if expert_samples.size(0) == 0:
-                continue
-            
-            # 正样本：当前专家的原型
-            positive_similarities = expert_similarities[:, start_idx:end_idx]  # [num_samples, prototypes_per_expert]
-            
-            # 检查正样本是否为空
-            if positive_similarities.size(1) == 0:
-                continue
-                
-            positive_max = positive_similarities.max(dim=1)[0]  # [num_samples]
-            
-            # 负样本：其他专家的原型
-            negative_mask = torch.ones(self.num_prototypes, dtype=torch.bool, device=expert_similarities.device)
-            negative_mask[start_idx:end_idx] = False
-            
-            # 检查负样本是否存在
-            if not negative_mask.any():
-                # 如果没有负样本，创建人工负样本（使用当前专家原型的反向）
-                negative_similarities = -positive_similarities
-            else:
-                negative_similarities = expert_similarities[:, negative_mask]  # [num_samples, other_prototypes]
-            
-            # 检查负样本数组是否为空
-            if negative_similarities.size(1) == 0:
-                continue
-                
-            negative_max = negative_similarities.max(dim=1)[0]  # [num_samples]
-            
-            # 对比损失：拉近正样本，推远负样本
-            margin = 0.5
-            contrastive_loss = F.relu(negative_max - positive_max + margin)
-            separation_losses.append(contrastive_loss.mean())
-        
-        if not separation_losses:
-            # 如果没有有效的分离损失，返回小的正则化项
-            return torch.tensor(0.01, device=expert_features.device)
-        
-        # 5. 添加原型间的排斥损失
-        # 确保不同专家的原型彼此远离
-        if self.num_prototypes > 1:
-            prototype_distances = torch.cdist(self.prototypes, self.prototypes, p=2)  # [num_prototypes, num_prototypes]
-            
-            # 创建专家分组mask - 动态处理
-            expert_groups = torch.arange(self.num_prototypes, device=self.prototypes.device) // prototypes_per_expert
-            same_expert_mask = expert_groups.unsqueeze(0) == expert_groups.unsqueeze(1)
-            different_expert_mask = ~same_expert_mask
-            
-            # 不同专家的原型应该距离较远
-            if different_expert_mask.any():
-                inter_expert_distances = prototype_distances[different_expert_mask]
-                repulsion_loss = F.relu(1.0 - inter_expert_distances).mean()  # 距离小于1时施加惩罚
-            else:
-                repulsion_loss = torch.tensor(0.0, device=expert_features.device)
-        else:
-            repulsion_loss = torch.tensor(0.0, device=expert_features.device)
-        
-        # 组合损失
-        total_separation_loss = torch.stack(separation_losses).mean() + 0.1 * repulsion_loss
-        
-        return total_separation_loss
-    
-    def inject_diversity_noise(self, expert_weights: torch.Tensor) -> torch.Tensor:
-        """
-        改进的多样性噪声注入机制
-        使用更智能的策略防止专家崩塌
-        """
-        if not self.force_diversity or not self.training:
-            return expert_weights
-        
-        batch_size, num_experts = expert_weights.shape
-        
-        # 1. 计算专家使用分布
-        expert_usage = expert_weights.mean(dim=0)  # [num_experts]
-        usage_entropy = -torch.sum(expert_usage * torch.log(expert_usage + 1e-8))
-        max_entropy = torch.log(torch.tensor(float(num_experts), device=expert_weights.device))
-        normalized_entropy = usage_entropy / max_entropy
-        
-        # 2. 检测专家崩塌
-        # 崩塌指标：最大使用率过高 + 熵过低
-        max_usage = expert_usage.max()
-        min_usage = expert_usage.min()
-        usage_ratio = max_usage / (min_usage + 1e-8)
-        
-        # 3. 自适应噪声强度
-        if normalized_entropy < 0.5 or usage_ratio > 5.0:
-            # 严重不均衡：较强噪声
-            noise_strength = 0.15
-            noise_type = 'strong'
-        elif normalized_entropy < 0.7 or usage_ratio > 3.0:
-            # 轻微不均衡：中等噪声
-            noise_strength = 0.08
-            noise_type = 'medium'
-        else:
-            # 均衡状态：轻微噪声或无噪声
-            noise_strength = 0.02
-            noise_type = 'light'
-        
-        # 4. 智能噪声注入策略
-        if noise_type == 'strong':
-            # 强噪声：重新平衡专家权重
-            # 对使用率低的专家给予额外的探索机会
-            exploration_bonus = torch.zeros_like(expert_weights)
-            
-            # 给使用率低于平均值的专家加分
-            below_avg_mask = expert_usage < expert_usage.mean()
-            if below_avg_mask.any():
-                exploration_bonus[:, below_avg_mask] = noise_strength
-            
-            # 添加小量随机噪声
-            random_noise = torch.randn_like(expert_weights) * (noise_strength * 0.3)
-            
-            noisy_weights = expert_weights + exploration_bonus + random_noise
-            
-        elif noise_type == 'medium':
-            # 中等噪声：温和的随机化
-            adaptive_noise = torch.randn_like(expert_weights) * noise_strength
-            # 对主导专家施加更多噪声
-            dominant_expert = torch.argmax(expert_usage)
-            adaptive_noise[:, dominant_expert] *= 1.5
-            
-            noisy_weights = expert_weights + adaptive_noise
-            
-        else:  # light noise
-            # 轻噪声：最小扰动
-            light_noise = torch.randn_like(expert_weights) * noise_strength
-            noisy_weights = expert_weights + light_noise
-        
-        # 5. 重新归一化并应用温度
-        noisy_weights = F.softmax(noisy_weights / self.temperature, dim=-1)
-        
-        # 6. 使用指数移动平均平滑变化（避免剧烈波动）
-        if hasattr(self, '_prev_expert_weights') and self._prev_expert_weights is not None:
-            # 检查批次大小是否匹配
-            if self._prev_expert_weights.size(0) == batch_size:
-                alpha = 0.8 if noise_type == 'strong' else 0.9
-                smoothed_weights = alpha * noisy_weights + (1 - alpha) * self._prev_expert_weights
-            else:
-                # 批次大小不匹配，不使用平滑
-                smoothed_weights = noisy_weights
-        else:
-            smoothed_weights = noisy_weights
-        
-        # 保存当前权重用于下次平滑（分离计算图）
-        self._prev_expert_weights = smoothed_weights.detach().clone()
-        
-        # 数值稳定性检查
-        if torch.isnan(smoothed_weights).any() or torch.isinf(smoothed_weights).any():
-            print("警告: 检测到smoothed_weights中的NaN或Inf值，使用均匀分布")
-            smoothed_weights = torch.ones_like(smoothed_weights) / smoothed_weights.size(-1)
-        
-        # 确保smoothed_weights为正数且和为1
-        smoothed_weights = torch.clamp(smoothed_weights, min=1e-8)
-        # 安全归一化：防止行向量全为0的情况
-        row_sums = smoothed_weights.sum(dim=-1, keepdim=True)
-        row_sums = torch.clamp(row_sums, min=1e-8)  # 防止除零
-        smoothed_weights = smoothed_weights / row_sums
-        
-        # 最终检查：确保每行和为1
-        if not torch.allclose(smoothed_weights.sum(dim=-1), torch.ones(smoothed_weights.size(0), device=smoothed_weights.device), atol=1e-6):
-            print("警告: 专家权重归一化失败，强制重新归一化")
-            smoothed_weights = F.softmax(torch.ones_like(smoothed_weights), dim=-1)
-        
-        return smoothed_weights
-    
-    def mine_triplets_based_on_prediction_performance(self, x: torch.Tensor, 
-                                                     expert_weights: torch.Tensor,
-                                                     expert_predictions: torch.Tensor,
-                                                     ground_truth: torch.Tensor) -> List[Tuple[int, int, int]]:
-        """
-        基于预测性能挖掘三元组
-        
-        Args:
-            x: 输入序列 [batch_size, seq_len, input_dim]
-            expert_weights: 专家权重 [batch_size, num_experts]
-            expert_predictions: 专家预测 [batch_size, num_experts, pred_len, input_dim]
-            ground_truth: 真实值 [batch_size, pred_len, input_dim]
-            
-        Returns:
-            三元组列表 [(anchor_idx, positive_idx, negative_idx), ...]
-        """
-        batch_size = x.size(0)
-        triplets = []
-        
-        # 边界条件检查
-        if batch_size < 3:
-            # 批次太小，无法构成有效的三元组
-            return triplets
-        
-        # 计算每个专家对每个样本的预测误差
-        expert_errors = torch.zeros(batch_size, self.num_experts, device=x.device)
+        # 4. 专家网络（FFT+ms-Mamba）
+        expert_configs = []
         for i in range(self.num_experts):
-            # expert_predictions[:, i, :, :] 是 [batch_size, pred_len, input_dim]
-            # ground_truth 是 [batch_size, pred_len, input_dim]
-            expert_errors[:, i] = F.mse_loss(
-                expert_predictions[:, i, :, :], 
-                ground_truth, 
-                reduction='none'
-            ).mean(dim=(1, 2))  # 对pred_len和input_dim维度求平均
+            expert_config = self.config.copy()
+            expert_config['model'] = self.config['model'].copy()
+            expert_config['model']['current_expert_id'] = i
+            # 专家网络直接处理原始滑动窗口
+            expert_config['model']['input_dim'] = self.input_dim
+            expert_config['model']['output_dim'] = self.hidden_dim
+            expert_configs.append(expert_config)
         
-        # 为每个样本找到最佳专家
-        best_experts = torch.argmin(expert_errors, dim=1)  # [batch_size]
+        self.experts = nn.ModuleList([
+            FFTmsMambaExpert(expert_config) for expert_config in expert_configs
+        ])
         
-        # 构建三元组 - 增强对小批次的处理
-        for anchor_idx in range(batch_size):
-            anchor_best_expert = best_experts[anchor_idx].item()
-            
-            # 寻找正样本：同样由该专家主导预测且预测准确的样本
-            positive_candidates = []
-            negative_candidates = []
-            
-            for candidate_idx in range(batch_size):
-                if candidate_idx == anchor_idx:
-                    continue
-                    
-                candidate_best_expert = best_experts[candidate_idx].item()
-                
-                if candidate_best_expert == anchor_best_expert:
-                    # 同一专家主导，作为正样本候选
-                    positive_candidates.append(candidate_idx)
-                else:
-                    # 不同专家主导，作为负样本候选
-                    negative_candidates.append(candidate_idx)
-            
-            # 选择最佳正样本和负样本 - 放宽条件以适应小批次
-            if positive_candidates and negative_candidates:
-                # 选择预测误差最小的正样本
-                positive_errors = expert_errors[positive_candidates, anchor_best_expert]
-                best_positive_idx = positive_candidates[torch.argmin(positive_errors).item()]
-                
-                # 选择预测误差最大的负样本（最难区分的负样本）
-                negative_errors = expert_errors[negative_candidates, anchor_best_expert]
-                hardest_negative_idx = negative_candidates[torch.argmax(negative_errors).item()]
-                
-                triplets.append((anchor_idx, best_positive_idx, hardest_negative_idx))
-            
-            elif not positive_candidates and negative_candidates:
-                # 没有正样本，但有负样本：使用最相似的样本作为正样本
-                if len(negative_candidates) >= 2:
-                    # 从负样本中选择误差最小的作为伪正样本
-                    negative_errors = expert_errors[negative_candidates, anchor_best_expert]
-                    sorted_indices = torch.argsort(negative_errors)
-                    pseudo_positive_idx = negative_candidates[sorted_indices[0].item()]
-                    hardest_negative_idx = negative_candidates[sorted_indices[-1].item()]
-                    triplets.append((anchor_idx, pseudo_positive_idx, hardest_negative_idx))
-            
-            elif positive_candidates and not negative_candidates:
-                # 没有负样本，但有正样本：使用最差的正样本作为负样本
-                if len(positive_candidates) >= 2:
-                    positive_errors = expert_errors[positive_candidates, anchor_best_expert]
-                    sorted_indices = torch.argsort(positive_errors)
-                    best_positive_idx = positive_candidates[sorted_indices[0].item()]
-                    pseudo_negative_idx = positive_candidates[sorted_indices[-1].item()]
-                    triplets.append((anchor_idx, best_positive_idx, pseudo_negative_idx))
-        
-        return triplets
-    
-    def compute_triplet_loss(self, embeddings: torch.Tensor, 
-                           triplets: List[Tuple[int, int, int]]) -> torch.Tensor:
-        """
-        计算三元组损失
-        
-        Args:
-            embeddings: 嵌入向量 [batch_size, embedding_dim]
-            triplets: 三元组列表
-            
-        Returns:
-            三元组损失
-        """
-        if not triplets:
-            return torch.tensor(0.0, device=embeddings.device)
-        
-        triplet_losses = []
-        
-        for anchor_idx, positive_idx, negative_idx in triplets:
-            anchor_emb = embeddings[anchor_idx]
-            positive_emb = embeddings[positive_idx]
-            negative_emb = embeddings[negative_idx]
-            
-            # 计算距离
-            pos_dist = F.pairwise_distance(anchor_emb.unsqueeze(0), positive_emb.unsqueeze(0))
-            neg_dist = F.pairwise_distance(anchor_emb.unsqueeze(0), negative_emb.unsqueeze(0))
-            
-            # 三元组损失
-            triplet_loss = F.relu(pos_dist - neg_dist + self.triplet_margin)
-            triplet_losses.append(triplet_loss)
-        
-        return torch.stack(triplet_losses).mean()
-    
-    def forward(self, x: torch.Tensor, ground_truth: Optional[torch.Tensor] = None, 
-                return_aux_info: bool = False) -> Dict[str, torch.Tensor]:
-        """
-        M²-MOEP前向传播
-        
-        Args:
-            x: 输入时间序列 [batch_size, seq_len, input_dim]
-            ground_truth: 真实值（用于三元组挖掘）[batch_size, pred_len, output_dim]
-            return_aux_info: 是否返回辅助信息
-            
-        Returns:
-            Dict包含predictions和可选的aux_info
-        """
-        batch_size = x.size(0)
-        
-        # 验证输入维度
-        if x.dim() != 3:
-            raise ValueError(f"输入x应为3维张量，实际维度: {x.dim()}")
-        
-        actual_seq_len, actual_input_dim = x.size(1), x.size(2)
-        if actual_seq_len != self.seq_len:
-            raise ValueError(f"序列长度不匹配: 期望{self.seq_len}，实际{actual_seq_len}")
-        
-        if actual_input_dim != self.input_dim:
-            raise ValueError(f"输入维度不匹配: 期望{self.input_dim}，实际{actual_input_dim}")
-        
-        # 验证ground_truth维度（如果提供）
-        if ground_truth is not None:
-            if ground_truth.dim() != 3:
-                raise ValueError(f"ground_truth应为3维张量，实际维度: {ground_truth.dim()}")
-            
-            gt_batch_size, gt_pred_len, gt_output_dim = ground_truth.size()
-            if gt_batch_size != batch_size:
-                raise ValueError(f"batch_size不匹配: 输入{batch_size}，ground_truth{gt_batch_size}")
-            
-            if gt_pred_len != self.pred_len:
-                raise ValueError(f"预测长度不匹配: 期望{self.pred_len}，实际{gt_pred_len}")
-            
-            if gt_output_dim != self.output_dim:
-                raise ValueError(f"输出维度不匹配: 期望{self.output_dim}，实际{gt_output_dim}")
-        
-        # 数值稳定性检查
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            raise ValueError("输入包含NaN或Inf值")
-        
-        if x.abs().max() > 1e6:
-            print(f"警告: 输入值过大 (max: {x.abs().max().item():.2e})")
-            x = torch.clamp(x, -1e6, 1e6)
-        
-        # === 1. Flow模型潜在表示映射 ===
-        # 展平输入用于Flow模型
-        x_flat = x.view(batch_size, -1)  # [batch_size, seq_len * input_dim]
-        
-        # 通过Flow模型映射到潜在空间
-        if self.use_pretrained_flow and not self.training:
-            # 推理时使用预训练的Flow模型
-            with torch.no_grad():
-                z_latent = self.flow_model.encode(x_flat)
-        else:
-            # 训练时或未使用预训练模型时
-            z_latent = self.flow_model.encode(x_flat)
-        
-        # === 2. 门控网络计算专家权重（接受潜在表示） ===
-        # 修复：门控网络返回的是负距离，需要正确应用温度缩放
-        gating_distances = self.gating(z_latent)  # [batch_size, num_experts] 负距离
-        expert_weights = F.softmax(gating_distances / self.temperature, dim=-1)
-        
-        # 中间张量验证
-        self._validate_intermediate_tensors(
-            {'z_latent': z_latent, 'expert_weights': expert_weights},
-            {'z_latent': (batch_size, self.flow_latent_dim), 'expert_weights': (batch_size, self.num_experts)}
+        # 5. 特征融合层
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.hidden_dim, self.hidden_dim)
         )
         
-        # === Top-k 稀疏激活 ===
-        top_k = self.config['model'].get('top_k', None)
-        if top_k is not None and top_k < self.num_experts:
-            # 为每个样本保留 top_k 权重，其余置零
-            topk_values, topk_indices = expert_weights.topk(top_k, dim=-1)
-            mask = torch.zeros_like(expert_weights)
-            mask.scatter_(1, topk_indices, 1.0)
-            expert_weights = expert_weights * mask
-            expert_weights = expert_weights / (expert_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        # 6. 预测头
+        self.prediction_head = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+            nn.LayerNorm(self.hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.hidden_dim // 2, self.pred_len * self.output_dim)
+        )
         
-        # === 3. 强制专家多样性 ===
-        if self.force_diversity:
-            expert_weights = self.inject_diversity_noise(expert_weights)
+        # 7. 温度参数（用于softmax路由）
+        self.temperature = nn.Parameter(torch.tensor(1.0))
         
-        # === 4. 专家预测 ===
-        expert_predictions = []
-        for i, expert in enumerate(self.experts):
-            expert_pred = expert(x)  # 专家网络现在输出 [batch_size, pred_len, input_dim]
-            expert_predictions.append(expert_pred)
+        # 8. 层归一化
+        self.layer_norm = nn.LayerNorm(self.hidden_dim)
+        self.output_norm = nn.LayerNorm(self.output_dim)
         
-        expert_predictions = torch.stack(expert_predictions, dim=1)  # [batch_size, num_experts, pred_len, input_dim]
+        # 移除不必要的组件
+        # - 删除位置编码（专家网络内部处理）
+        # - 删除复杂的路由器（使用简单的原型距离）
+        # - 删除多样性原型（专家原型已足够）
+    
+    def _init_temperature_scheduler(self):
+        """初始化温度调度器"""
+        temp_config = self.model_config.get('temperature', {})
+        self.temperature = temp_config.get('initial', 1.0)
+        self.temp_min = temp_config.get('min', 0.1)
+        self.temp_max = temp_config.get('max', 5.0)
+        self.temp_decay = temp_config.get('decay', 0.95)
+        self.temp_schedule = temp_config.get('schedule', 'fixed')
         
-        # 验证专家预测维度
-        expected_expert_shape = (batch_size, self.num_experts, self.pred_len, self.output_dim)
-        if expert_predictions.shape != expected_expert_shape:
-            raise ValueError(f"专家预测维度不匹配: 期望{expected_expert_shape}，实际{expert_predictions.shape}")
-        
-        # === 5. 加权融合 ===
-        # 扩展专家权重以匹配输出维度
-        expert_weights_expanded = expert_weights.unsqueeze(-1).unsqueeze(-1)  # [batch_size, num_experts, 1, 1]
-        weighted_predictions = torch.sum(
-            expert_predictions * expert_weights_expanded, 
-            dim=1
-        )  # [batch_size, pred_len, input_dim]
-        
-        # 验证最终输出维度
-        expected_output_shape = (batch_size, self.pred_len, self.output_dim)
-        if weighted_predictions.shape != expected_output_shape:
-            raise ValueError(f"最终输出维度不匹配: 期望{expected_output_shape}，实际{weighted_predictions.shape}")
-        
-        # === 6. 辅助信息和损失计算 ===
-        aux_info = {}
-        if return_aux_info or self.training:
-            # 计算专家特征
-            expert_features = self.compute_expert_features(x)
-            
-            # 计算原型分离损失
-            prototype_loss = self.compute_prototype_separation_loss(expert_features, expert_weights)
-            
-            # 计算负载均衡损失
-            expert_usage = expert_weights.mean(dim=0)
-            load_balance_loss = torch.var(expert_usage) * self.num_experts
-            
-            # 计算Flow重构损失
-            x_reconstructed = self.flow_model.reconstruct(x_flat)
-            reconstruction_loss = F.mse_loss(x_reconstructed, x_flat)
-            
-            # 计算基于预测性能的三元组损失
-            triplet_loss = torch.tensor(0.0, device=x.device)
-            gating_embeddings = self.gating.get_embeddings(z_latent)
-            
-            if ground_truth is not None and self.training:
-                # 挖掘三元组
-                triplets = self.mine_triplets_based_on_prediction_performance(
-                    x, expert_weights, expert_predictions, ground_truth
-                )
-                
-                # 计算三元组损失
-                triplet_loss = self.compute_triplet_loss(gating_embeddings, triplets)
-            
-            # 为一致性损失提供嵌入
-            aux_info['gating_embeddings'] = gating_embeddings
-            
-            aux_info.update({
-                'expert_weights': expert_weights,
-                'expert_predictions': expert_predictions,
-                'expert_usage': expert_usage,
-                'prototype_loss': prototype_loss,
-                'load_balance_loss': load_balance_loss,
-                'reconstruction_loss': reconstruction_loss,
-                'triplet_loss': triplet_loss,
-                'temperature': self.temperature,
-                'expert_features': expert_features,
-                'latent_representation': z_latent
-            })
-        
-        # 训练时的额外检查
-        if self.training:
-            # 检查数值稳定性
-            if torch.isnan(weighted_predictions).any() or torch.isinf(weighted_predictions).any():
-                print("警告: 预测值中检测到NaN或Inf，使用备用策略")
-                # 使用简单的平均预测作为备用
-                weighted_predictions = expert_predictions.mean(dim=1)
-        
-        return {
-            'predictions': weighted_predictions,
-            'aux_info': aux_info
+        # 温度调度统计
+        self.temp_stats = {
+            'current': self.temperature,
+            'adjustments': 0,
+            'performance_history': []
         }
     
-    def get_expert_analysis(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """获取专家分析信息"""
-        with torch.no_grad():
-            output = self.forward(x, return_aux_info=True)
-            aux_info = output['aux_info']
-            
-            # 计算专家多样性指标
-            expert_weights = aux_info['expert_weights']
-            expert_predictions = aux_info['expert_predictions']
-            
-            # 专家使用分布
-            expert_usage = expert_weights.mean(dim=0)
-            usage_entropy = -torch.sum(expert_usage * torch.log(expert_usage + 1e-8))
-            
-            # 专家预测多样性
-            pred_diversity = torch.std(expert_predictions, dim=1).mean()
-            
-            # 专家权重分布
-            weight_entropy = -torch.sum(
-                expert_weights * torch.log(expert_weights + 1e-8), 
-                dim=1
-            ).mean()
-            
-            return {
-                'expert_usage': expert_usage,
-                'usage_entropy': usage_entropy,
-                'prediction_diversity': pred_diversity,
-                'weight_entropy': weight_entropy,
-                'temperature': self.temperature,
-                'expert_weights': expert_weights,
-                'expert_predictions': expert_predictions
-            }
+    def _init_loss_stats(self):
+        """初始化损失统计"""
+        self.loss_stats = {
+            'total_loss': 0.0,
+            'prediction_loss': 0.0,
+            'triplet_loss': 0.0,
+            'diversity_loss': 0.0,
+            'consistency_loss': 0.0,
+            'reconstruction_loss': 0.0,
+            'load_balance_loss': 0.0,
+            'step_count': 0
+        }
     
-    def get_config(self) -> Dict:
-        """获取模型配置"""
+    def _init_weights(self):
+        """初始化模型权重"""
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    constant_(module.bias, 0)
+            elif isinstance(module, nn.LayerNorm):
+                constant_(module.bias, 0)
+                constant_(module.weight, 1.0)
+    
+    def forward(self, x: torch.Tensor, ground_truth: torch.Tensor = None, 
+                return_details: bool = False, return_aux_info: bool = False) -> Union[torch.Tensor, Dict]:
+        """
+        前向传播 - 🔧 严格按照M²-MOEP文档工作流程
+        
+        工作流程：
+        1. 潜在空间映射：Wi → zi (通过Flow模型)
+        2. 度量学习门控：zi → embi (通过孪生编码器)
+        3. 专家路由：embi与专家原型计算距离 → αk
+        4. 专家预测：原始输入gni → 专家输出
+        5. 结果聚合：加权求和得到最终预测
+        
+        Args:
+            x: 输入张量 [batch_size, seq_len, input_dim]
+            ground_truth: 真实值张量，可选
+            return_details: 是否返回详细信息
+            return_aux_info: 是否返回辅助信息（兼容训练器）
+            
+        Returns:
+            预测结果或详细信息字典
+        """
+        # return_aux_info 与 return_details 等价
+        if return_aux_info:
+            return_details = True
+        
+        batch_size, seq_len, input_dim = x.size()
+        
+        # 确保输入在正确设备上
+        x = x.to(self.device)
+        
+        # === 步骤1：潜在空间映射 Wi → zi ===
+        # 扁平化输入用于Flow模型
+        x_flat = x.view(batch_size, -1)  # [batch_size, seq_len * input_dim]
+        
+        try:
+            # 通过Flow模型映射到潜在空间
+            z_latent, flow_log_det = self.flow_model(x_flat)
+            
+            # 数值稳定性检查
+            if torch.isnan(z_latent).any() or torch.isinf(z_latent).any():
+                print("⚠️ Flow模型输出异常，使用原始输入")
+                z_latent = x_flat
+                flow_log_det = torch.zeros(batch_size, device=self.device)
+                
+        except Exception as e:
+            print(f"⚠️ Flow模型处理失败: {e}")
+            z_latent = x_flat
+            flow_log_det = torch.zeros(batch_size, device=self.device)
+        
+        # === 步骤2：度量学习门控 zi → embi ===
+        # 通过孪生编码器生成嵌入向量
+        embedding_vector = self.gating_encoder(z_latent)  # [batch_size, 128]
+        
+        # === 步骤3：专家路由 embi与专家原型计算距离 → αk ===
+        # 计算嵌入向量与专家原型的距离
+        distances = torch.cdist(
+            embedding_vector.unsqueeze(1),  # [batch_size, 1, 128]
+            self.expert_prototypes.unsqueeze(0)  # [1, num_experts, 128]
+        ).squeeze(1)  # [batch_size, num_experts]
+        
+        # 使用负距离和温度参数计算路由权重
+        routing_logits = -distances / torch.clamp(self.temperature, min=0.1, max=5.0)
+        expert_weights = F.softmax(routing_logits, dim=-1)  # [batch_size, num_experts]
+        
+        # === 步骤4：专家预测 原始输入gni → 专家输出 ===
+        expert_outputs = []
+        expert_details = []
+        
+        for i, expert in enumerate(self.experts):
+            # 确保专家网络在正确设备上
+            expert_input = x.to(expert.device if hasattr(expert, 'device') else self.device)
+            
+            try:
+                # 专家网络处理原始滑动窗口
+                expert_output = expert(expert_input, return_features=True)
+                
+                if isinstance(expert_output, dict):
+                    expert_outputs.append(expert_output['output'])
+                    expert_details.append(expert_output)
+                else:
+                    expert_outputs.append(expert_output)
+                    expert_details.append({'output': expert_output})
+                    
+            except Exception as e:
+                print(f"⚠️ 专家{i}处理失败: {e}")
+                # 使用零填充作为备选
+                fallback_output = torch.zeros(batch_size, seq_len, self.hidden_dim, device=self.device)
+                expert_outputs.append(fallback_output)
+                expert_details.append({'output': fallback_output, 'error': str(e)})
+        
+        # === 步骤5：结果聚合 加权求和得到最终预测 ===
+        expert_outputs = torch.stack(expert_outputs, dim=1)  # [batch_size, num_experts, seq_len, hidden_dim]
+        expert_weights_expanded = expert_weights.unsqueeze(-1).unsqueeze(-1)  # [batch_size, num_experts, 1, 1]
+        
+        # 加权求和
+        fused_output = torch.sum(expert_outputs * expert_weights_expanded, dim=1)  # [batch_size, seq_len, hidden_dim]
+        
+        # 特征融合
+        fused_output = self.feature_fusion(fused_output)
+        fused_output = self.layer_norm(fused_output)
+        
+        # 预测头：使用最后一个时间步的特征进行预测
+        last_hidden = fused_output[:, -1, :]  # [batch_size, hidden_dim]
+        predictions = self.prediction_head(last_hidden)  # [batch_size, pred_len * output_dim]
+        predictions = predictions.view(batch_size, self.pred_len, self.output_dim)
+        predictions = self.output_norm(predictions)
+        
+        if return_details:
+            # 🔧 修复：正确生成expert_embeddings
+            expert_embeddings = embedding_vector  # [batch_size, 128]
+            
+            # 构建完整的输出字典
+            output_dict = {
+                'predictions': predictions,
+                'expert_weights': expert_weights,
+                'expert_outputs': expert_outputs,
+                'expert_details': expert_details,
+                'fused_features': fused_output,
+                'latent_features': z_latent,
+                'embedding_vector': embedding_vector,
+                'expert_prototypes': self.expert_prototypes,
+                'routing_distances': distances,
+                'routing_logits': routing_logits,
+                'flow_log_det': flow_log_det,
+                'hidden_states': last_hidden,
+                'temperature': self.temperature.item(),
+                'loss_stats': self.loss_stats,
+                # 🔧 修复：添加正确的expert_embeddings到aux_info
+                'aux_info': {
+                    'expert_weights': expert_weights,
+                    'expert_embeddings': expert_embeddings,  # 🔧 关键修复
+                    'flow_embeddings': z_latent,
+                    'flow_log_det': flow_log_det,
+                    'routing_entropy': -torch.sum(expert_weights * torch.log(expert_weights + 1e-8), dim=-1).mean().item(),
+                    'temperature': self.temperature.item(),
+                    'num_experts_used': (expert_weights > 0.01).sum(dim=1).float().mean().item(),
+                    'prototype_distances': distances.mean(dim=0).tolist()
+                }
+            }
+            
+            return output_dict
+        else:
+            return {'predictions': predictions}
+    
+    def compute_loss(self, outputs: Dict, targets: torch.Tensor, epoch: int = 0) -> Dict:
+        """
+        计算M²-MOEP复合损失函数 - 🔧 按照文档要求重新实现
+        
+        复合损失包含：
+        1. 重构损失 (Lrc): 确保Flow模型保留原始序列信息
+        2. 路由损失 (Lcl): 三元组损失训练度量学习门控
+        3. 预测损失 (Lpr): 主要的预测性能指标
+        
+        Args:
+            outputs: 模型输出字典
+            targets: 目标张量 [batch_size, pred_len, output_dim]
+            epoch: 当前训练轮次
+            
+        Returns:
+            损失字典
+        """
+        predictions = outputs['predictions']
+        aux_info = outputs.get('aux_info', {})
+        
+        # 确保预测和目标在同一设备
+        predictions = predictions.to(targets.device)
+        
+        # 损失权重配置
+        loss_weights = self.training_config.get('loss_weights', {})
+        
+        # === 1. 预测损失 (Lpr) - 主要损失 ===
+        prediction_loss = F.mse_loss(predictions, targets)
+        
+        # === 2. 重构损失 (Lrc) - Flow模型保真度 ===
+        reconstruction_loss = self._compute_flow_reconstruction_loss(
+            outputs.get('latent_features'),
+            outputs.get('flow_log_det'),
+            targets
+        )
+        
+        # === 3. 路由损失 (Lcl) - 三元组损失 ===
+        triplet_loss = self._compute_triplet_routing_loss(
+            aux_info.get('expert_embeddings'),
+            aux_info.get('expert_weights'),
+            predictions,
+            targets
+        )
+        
+        # === 4. 专家原型正则化损失 ===
+        prototype_reg_loss = self._compute_prototype_regularization()
+        
+        # === 5. 负载均衡损失 ===
+        load_balance_loss = self._compute_load_balance_loss(
+            aux_info.get('expert_weights')
+        )
+        
+        # === 复合损失计算 ===
+        # 使用文档中提到的不确定性加权方法（简化版）
+        total_loss = (
+            loss_weights.get('prediction', 1.0) * prediction_loss +
+            loss_weights.get('reconstruction', 0.1) * reconstruction_loss +
+            loss_weights.get('triplet', 0.1) * triplet_loss +
+            loss_weights.get('prototype_reg', 0.01) * prototype_reg_loss +
+            loss_weights.get('load_balance', 0.01) * load_balance_loss
+        )
+        
+        # 数值稳定性检查
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            print("⚠️ 检测到NaN/Inf损失，使用备用损失")
+            total_loss = prediction_loss
+        
+        # 更新损失统计
+        self.loss_stats.update({
+            'total_loss': total_loss.item(),
+            'prediction_loss': prediction_loss.item(),
+            'reconstruction_loss': reconstruction_loss.item(),
+            'triplet_loss': triplet_loss.item(),
+            'prototype_reg_loss': prototype_reg_loss.item(),
+            'load_balance_loss': load_balance_loss.item(),
+            'step_count': self.loss_stats['step_count'] + 1
+        })
+        
         return {
-            'model_type': 'M2_MOEP',
+            'total_loss': total_loss,
+            'prediction_loss': prediction_loss,
+            'reconstruction_loss': reconstruction_loss,
+            'triplet_loss': triplet_loss,
+            'prototype_reg_loss': prototype_reg_loss,
+            'load_balance_loss': load_balance_loss,
+            'loss_stats': self.loss_stats
+        }
+    
+    def _compute_flow_reconstruction_loss(self, latent_features: torch.Tensor, 
+                                        flow_log_det: torch.Tensor, 
+                                        targets: torch.Tensor) -> torch.Tensor:
+        """计算Flow模型重构损失 - 按照文档公式实现"""
+        if latent_features is None:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+        
+        try:
+            # 重构原始输入
+            batch_size = latent_features.size(0)
+            reconstructed = self.flow_model.reconstruct(latent_features)
+            
+            # 将重构结果reshape回原始输入形状
+            original_input = reconstructed.view(batch_size, self.seq_len, self.input_dim)
+            
+            # 计算重构误差（使用targets的前seq_len步作为参考）
+            if targets.size(1) >= self.seq_len:
+                reference = targets[:, :self.seq_len, :]
+            else:
+                # 如果targets长度不够，使用可用的部分
+                reference = targets
+                original_input = original_input[:, :targets.size(1), :]
+            
+            # MSE重构损失
+            reconstruction_mse = F.mse_loss(original_input, reference)
+            
+            # 添加Flow模型的对数行列式项（正则化）
+            if flow_log_det is not None:
+                log_det_reg = torch.mean(flow_log_det ** 2) * 0.01
+                reconstruction_loss = reconstruction_mse + log_det_reg
+            else:
+                reconstruction_loss = reconstruction_mse
+            
+            # 数值稳定性检查
+            if torch.isnan(reconstruction_loss) or torch.isinf(reconstruction_loss):
+                return torch.tensor(0.0, device=self.device, requires_grad=True)
+            
+            return reconstruction_loss
+            
+        except Exception as e:
+            print(f"⚠️ Flow重构损失计算失败: {e}")
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+    
+    def _compute_triplet_routing_loss(self, expert_embeddings: torch.Tensor,
+                                    expert_weights: torch.Tensor,
+                                    predictions: torch.Tensor,
+                                    targets: torch.Tensor) -> torch.Tensor:
+        """计算三元组路由损失 - 按照文档要求实现"""
+        if expert_embeddings is None or expert_weights is None:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+        
+        try:
+            batch_size = expert_embeddings.size(0)
+            if batch_size < 3:
+                return torch.tensor(0.0, device=self.device, requires_grad=True)
+            
+            # 计算预测误差，用于构建三元组
+            prediction_errors = F.mse_loss(predictions, targets, reduction='none')
+            prediction_errors = prediction_errors.mean(dim=(1, 2))  # [batch_size]
+            
+            # 根据预测误差排序，构建三元组
+            sorted_indices = torch.argsort(prediction_errors)
+            
+            # 选择锚点、正样本、负样本
+            num_triplets = min(batch_size // 3, 10)  # 限制三元组数量
+            if num_triplets == 0:
+                return torch.tensor(0.0, device=self.device, requires_grad=True)
+            
+            anchors = expert_embeddings[sorted_indices[:num_triplets]]
+            positives = expert_embeddings[sorted_indices[num_triplets:2*num_triplets]]
+            negatives = expert_embeddings[sorted_indices[-num_triplets:]]
+            
+            # 计算三元组损失
+            pos_dist = F.pairwise_distance(anchors, positives, 2)
+            neg_dist = F.pairwise_distance(anchors, negatives, 2)
+            
+            margin = self.model_config.get('triplet', {}).get('margin', 0.5)
+            triplet_loss = F.relu(pos_dist - neg_dist + margin).mean()
+            
+            # 数值稳定性检查
+            if torch.isnan(triplet_loss) or torch.isinf(triplet_loss):
+                return torch.tensor(0.0, device=self.device, requires_grad=True)
+            
+            return triplet_loss
+            
+        except Exception as e:
+            print(f"⚠️ 三元组损失计算失败: {e}")
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+    
+    def _compute_prototype_regularization(self) -> torch.Tensor:
+        """计算专家原型正则化损失"""
+        try:
+            # 鼓励专家原型之间的多样性
+            prototypes = self.expert_prototypes  # [num_experts, 128]
+            
+            # 计算原型之间的相似度矩阵
+            similarity_matrix = torch.mm(prototypes, prototypes.t())  # [num_experts, num_experts]
+            
+            # 除去对角线元素（自身相似度）
+            mask = torch.eye(self.num_experts, device=self.device)
+            off_diagonal = similarity_matrix * (1 - mask)
+            
+            # 最小化非对角线元素（鼓励原型多样性）
+            diversity_loss = torch.mean(off_diagonal ** 2)
+            
+            # 防止原型范数过大
+            norm_reg = torch.mean(torch.norm(prototypes, dim=1) ** 2) * 0.01
+            
+            return diversity_loss + norm_reg
+            
+        except Exception as e:
+            print(f"⚠️ 原型正则化损失计算失败: {e}")
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+    
+    def _compute_load_balance_loss(self, expert_weights: torch.Tensor) -> torch.Tensor:
+        """计算负载均衡损失"""
+        if expert_weights is None:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+        
+        try:
+            # 计算专家权重的均匀性
+            mean_weights = expert_weights.mean(dim=0)  # [num_experts]
+            target_weight = 1.0 / self.num_experts
+            
+            # 鼓励权重分布均匀
+            load_balance_loss = torch.mean((mean_weights - target_weight) ** 2)
+            
+            return load_balance_loss
+            
+        except Exception as e:
+            print(f"⚠️ 负载均衡损失计算失败: {e}")
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+    
+    def update_temperature(self, performance_metric: float):
+        """更新温度参数"""
+        if self.temp_schedule == 'fixed':
+            return
+        
+        self.temp_stats['performance_history'].append(performance_metric)
+        
+        if self.temp_schedule == 'adaptive':
+            # 自适应温度调整
+            if len(self.temp_stats['performance_history']) >= 2:
+                current_perf = self.temp_stats['performance_history'][-1]
+                prev_perf = self.temp_stats['performance_history'][-2]
+                
+                if current_perf > prev_perf:  # 性能提升
+                    self.temperature = max(self.temp_min, self.temperature * self.temp_decay)
+                else:  # 性能下降
+                    self.temperature = min(self.temp_max, self.temperature / self.temp_decay)
+                
+                self.temp_stats['adjustments'] += 1
+        
+        self.temp_stats['current'] = self.temperature
+    
+    def to(self, device):
+        """重写to方法，确保所有组件都移动到正确设备"""
+        super().to(device)
+        
+        # 确保所有专家网络都在正确设备上
+        # 对于使用mamba的专家网络，需要特别处理
+        for i, expert in enumerate(self.experts):
+            try:
+                expert.to(device)
+            except Exception as e:
+                print(f"⚠️ 专家{i}移动到设备{device}时出错: {e}")
+                # 如果是mamba相关的错误，可能需要强制在CUDA上
+                if hasattr(expert, 'use_mamba') and expert.use_mamba:
+                    if device.type != 'cuda' and torch.cuda.is_available():
+                        print(f"⚠️ 专家{i}使用mamba，强制移动到CUDA")
+                        expert.to(torch.device('cuda'))
+                    else:
+                        print(f"⚠️ 专家{i}切换到LSTM模式")
+                        expert.use_mamba = False
+                        # 重新初始化为LSTM
+                        expert._init_lstm_fallback()
+                        expert.to(device)
+                else:
+                    expert.to(device)
+        
+        self.device = device
+        return self
+    
+    def get_model_info(self) -> Dict:
+        """获取模型信息"""
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        
+        expert_params = []
+        for i, expert in enumerate(self.experts):
+            expert_param_count = sum(p.numel() for p in expert.parameters())
+            expert_params.append({
+                'expert_id': i,
+                'parameters': expert_param_count,
+                'use_mamba': getattr(expert, 'use_mamba', False)
+            })
+        
+        return {
+            'model_name': 'M²-MOEP',
+            'total_parameters': total_params,
+            'trainable_parameters': trainable_params,
+            'expert_parameters': expert_params,
+            'num_experts': self.num_experts,
             'input_dim': self.input_dim,
             'hidden_dim': self.hidden_dim,
             'output_dim': self.output_dim,
-            'num_experts': self.num_experts,
             'seq_len': self.seq_len,
             'pred_len': self.pred_len,
             'temperature': self.temperature,
-            'diversity_config': self.diversity_config
+            'device': str(self.device)
         }
+
+
+class PositionalEncoding(nn.Module):
+    """位置编码模块"""
+    
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [batch_size, seq_len, d_model]
+        Returns:
+            [batch_size, seq_len, d_model]
+        """
+        return x + self.pe[:x.size(1), :].transpose(0, 1)
+
+
+class ExpertRouter(nn.Module):
+    """专家路由器"""
+    
+    def __init__(self, input_dim: int, num_experts: int, hidden_dim: int = 256):
+        super().__init__()
+        
+        self.num_experts = num_experts
+        
+        # 路由网络
+        self.routing_network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, num_experts)
+        )
+        
+        # 门控网络
+        self.gate_network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_experts),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x: torch.Tensor, temperature: float = 1.0) -> Tuple[torch.Tensor, Dict]:
+        """
+        Args:
+            x: [batch_size, seq_len, input_dim]
+            temperature: 温度参数
+        Returns:
+            expert_weights: [batch_size, num_experts]
+            routing_info: 路由信息字典
+        """
+        # 使用平均池化获取序列级别的特征
+        pooled_x = torch.mean(x, dim=1)  # [batch_size, input_dim]
+        
+        # 路由得分
+        routing_logits = self.routing_network(pooled_x)  # [batch_size, num_experts]
+        
+        # 门控得分
+        gate_scores = self.gate_network(pooled_x)  # [batch_size, num_experts]
+        
+        # 应用温度缩放
+        routing_logits = routing_logits / temperature
+        
+        # 计算softmax权重
+        routing_weights = F.softmax(routing_logits, dim=-1)
+        
+        # 应用门控
+        expert_weights = routing_weights * gate_scores
+        
+        # 重新归一化
+        expert_weights = expert_weights / (expert_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        
+        # 路由信息
+        routing_info = {
+            'routing_logits': routing_logits,
+            'routing_weights': routing_weights,
+            'gate_scores': gate_scores,
+            'expert_weights': expert_weights,
+            'temperature': temperature,
+            'entropy': -torch.sum(expert_weights * torch.log(expert_weights + 1e-8), dim=-1).mean()
+        }
+        
+        return expert_weights, routing_info 

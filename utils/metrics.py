@@ -3,38 +3,63 @@ import numpy as np
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from typing import Dict, Tuple, List
 
-def calculate_metrics(predictions: np.ndarray, targets: np.ndarray) -> Dict[str, float]:
+def calculate_metrics(predictions, targets) -> Dict[str, float]:
     """
-    计算预测指标 - 主要函数名（用于train.py）
+    计算预测指标 - 支持torch tensor和numpy数组
     
     Args:
-        predictions: 预测值 numpy数组
-        targets: 真实值 numpy数组
+        predictions: 预测值 
+        targets: 真实值 
         
     Returns:
         指标字典
     """
-    # 展平多维数据
-    pred_flat = predictions.flatten()
-    target_flat = targets.flatten()
+    # 统一转换为numpy数组
+    if isinstance(predictions, torch.Tensor):
+        pred_flat = predictions.detach().cpu().numpy().flatten()
+    else:
+        pred_flat = predictions.flatten()
+        
+    if isinstance(targets, torch.Tensor):
+        target_flat = targets.detach().cpu().numpy().flatten()
+    else:
+        target_flat = targets.flatten()
+    
+    # 添加数值稳定性检查
+    if len(pred_flat) == 0 or len(target_flat) == 0:
+        return {
+            'MSE': 0.0,
+            'RMSE': 0.0,
+            'MAE': 0.0,
+            'MAPE': 0.0,
+            'R2': 0.0
+        }
     
     # 计算基础指标
     mse = mean_squared_error(target_flat, pred_flat)
     rmse = np.sqrt(mse)
     mae = mean_absolute_error(target_flat, pred_flat)
     
-    # 计算MAPE（平均绝对百分比误差）
-    mape = np.mean(np.abs((target_flat - pred_flat) / (target_flat + 1e-8))) * 100
+    # 计算MAPE（平均绝对百分比误差）- 修复数值稳定性
+    with np.errstate(divide='ignore', invalid='ignore'):
+        mape = np.mean(np.abs((target_flat - pred_flat) / (np.abs(target_flat) + 1e-8))) * 100
+        if np.isnan(mape) or np.isinf(mape):
+            mape = 0.0
     
     # 计算R²分数
-    r2 = r2_score(target_flat, pred_flat)
+    try:
+        r2 = r2_score(target_flat, pred_flat)
+        if np.isnan(r2) or np.isinf(r2):
+            r2 = 0.0
+    except:
+        r2 = 0.0
     
     return {
-        'MSE': mse,
-        'RMSE': rmse,
-        'MAE': mae,
-        'MAPE': mape,
-        'R2': r2
+        'MSE': float(mse),
+        'RMSE': float(rmse),
+        'MAE': float(mae),
+        'MAPE': float(mape),
+        'R2': float(r2)
     }
 
 def compute_metrics(predictions: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:

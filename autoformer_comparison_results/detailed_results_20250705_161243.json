@@ -1,0 +1,10 @@
+{
+  "Weather": {
+    "96": {
+      "dataset": "Weather",
+      "prediction_length": 96,
+      "error": "'aux_info'",
+      "status": "failed"
+    }
+  }
+}
