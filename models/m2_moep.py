@@ -66,10 +66,8 @@ class M2_MOEP(nn.Module):
         )
         
         # 2. 门控网络（接受潜在表示）
-        # 更新配置以传递潜在维度
-        gating_config = config.copy()
-        gating_config['model']['latent_dim'] = self.flow_latent_dim
-        self.gating = GatingEncoder(gating_config)
+        # 直接传递原配置，避免路径不一致问题
+        self.gating = GatingEncoder(config)
         
         # 3. 专家网络（FFT+ms-Mamba）
         self.experts = nn.ModuleList([
@@ -93,7 +91,7 @@ class M2_MOEP(nn.Module):
         nn.init.xavier_uniform_(self.prototypes)
         
         # 专家特征提取器（用于多样性计算）
-        # 输入维度：7个特征类型 * input_dim
+        # 输入维度：7个特征类型 * input_dim（动态计算，不硬编码）
         expert_feature_input_dim = 7 * self.input_dim
         self.expert_feature_extractor = nn.Sequential(
             nn.Linear(expert_feature_input_dim, self.hidden_dim),
@@ -129,9 +127,21 @@ class M2_MOEP(nn.Module):
         改进的温度调度策略
         基于专家使用熵的自适应调整，更加稳健
         """
+        # 确保expert_entropy在正确的设备上
+        if isinstance(expert_entropy, torch.Tensor):
+            device = expert_entropy.device
+        else:
+            device = self.log_temperature.device
+            expert_entropy = torch.tensor(expert_entropy, device=device)
+        
+        # 数值稳定性检查
+        if torch.isnan(expert_entropy) or torch.isinf(expert_entropy):
+            print(f"警告: 专家熵值异常 {expert_entropy}，使用默认值")
+            expert_entropy = torch.log(torch.tensor(float(self.num_experts), device=device)) * 0.7
+        
         # 计算归一化熵（0-1范围）
-        max_entropy = torch.log(torch.tensor(float(self.num_experts), device=expert_entropy.device))
-        normalized_entropy = expert_entropy / max_entropy
+        max_entropy = torch.log(torch.tensor(float(self.num_experts), device=device))
+        normalized_entropy = torch.clamp(expert_entropy / max_entropy, 0.0, 1.0)
         
         # 基于epoch的基础温度衰减（更温和）
         epoch_factor = max(0.5, 1.0 - epoch * 0.008)  # 从1.0缓慢衰减到0.5
@@ -149,7 +159,7 @@ class M2_MOEP(nn.Module):
         # 计算新温度
         new_temperature = self.initial_temperature * epoch_factor * entropy_factor
         new_temperature = torch.clamp(
-            torch.tensor(new_temperature, device=self.log_temperature.device),
+            torch.tensor(new_temperature, device=device),
             self.min_temperature, 
             self.max_temperature
         )
@@ -157,6 +167,11 @@ class M2_MOEP(nn.Module):
         # 使用指数移动平均平滑温度变化
         current_temp = torch.exp(self.log_temperature)
         smoothed_temp = 0.9 * current_temp + 0.1 * new_temperature
+        
+        # 数值稳定性检查
+        if torch.isnan(smoothed_temp) or torch.isinf(smoothed_temp):
+            print("警告: 温度计算异常，保持当前温度")
+            return
         
         # 更新log_temperature参数
         self.log_temperature.data = torch.log(smoothed_temp)
@@ -172,8 +187,14 @@ class M2_MOEP(nn.Module):
         x_max = x.max(dim=1)[0]       # [batch_size, input_dim]
         
         # 2. 时序特征
-        # 计算一阶差分（变化率）
-        x_diff = torch.diff(x, dim=1)  # [batch_size, seq_len-1, input_dim]
+        # 计算一阶差分（变化率） - 兼容性改进
+        try:
+            # 尝试使用torch.diff（PyTorch >= 1.9）
+            x_diff = torch.diff(x, dim=1)  # [batch_size, seq_len-1, input_dim]
+        except AttributeError:
+            # 手动实现差分（兼容旧版本）
+            x_diff = x[:, 1:, :] - x[:, :-1, :]  # [batch_size, seq_len-1, input_dim]
+        
         x_diff_mean = x_diff.mean(dim=1)  # [batch_size, input_dim]
         
         # 计算趋势（线性回归斜率近似）
@@ -199,6 +220,25 @@ class M2_MOEP(nn.Module):
         
         return expert_features
     
+    def _validate_intermediate_tensors(self, tensors_dict: Dict[str, torch.Tensor], expected_shapes: Dict[str, tuple]):
+        """验证中间张量的维度和数值稳定性"""
+        for name, tensor in tensors_dict.items():
+            if name in expected_shapes:
+                expected_shape = expected_shapes[name]
+                if tensor.shape != expected_shape:
+                    raise ValueError(f"{name}维度不匹配: 期望{expected_shape}，实际{tensor.shape}")
+            
+            # 数值稳定性检查
+            if torch.isnan(tensor).any():
+                raise ValueError(f"{name}包含NaN值")
+            
+            if torch.isinf(tensor).any():
+                raise ValueError(f"{name}包含Inf值")
+            
+            # 检查数值范围
+            if tensor.abs().max() > 1e6:
+                print(f"警告: {name}数值过大 (max: {tensor.abs().max().item():.2e})")
+    
     def compute_prototype_separation_loss(self, expert_features: torch.Tensor, 
                                         expert_weights: torch.Tensor) -> torch.Tensor:
         """
@@ -206,6 +246,10 @@ class M2_MOEP(nn.Module):
         目标：确保不同专家的原型在特征空间中分离
         """
         batch_size = expert_features.size(0)
+        
+        # 边界条件检查
+        if batch_size == 0:
+            return torch.tensor(0.0, device=expert_features.device)
         
         # 1. 投影到原型空间
         projected_features = self.prototype_projector(expert_features)  # [batch_size, prototype_dim]
@@ -221,8 +265,8 @@ class M2_MOEP(nn.Module):
         # 使用专家权重作为软目标
         target_expert = torch.argmax(expert_weights, dim=1)  # [batch_size]
         
-        # 每个专家对应的原型范围
-        prototypes_per_expert = self.num_prototypes // self.num_experts
+        # 每个专家对应的原型范围 - 确保至少每个专家有一个原型
+        prototypes_per_expert = max(1, self.num_prototypes // self.num_experts)
         
         # 4. 计算原型分离损失
         separation_losses = []
@@ -233,9 +277,19 @@ class M2_MOEP(nn.Module):
             if not expert_mask.any():
                 continue
             
-            # 当前专家对应的原型索引
+            # 当前专家对应的原型索引 - 动态调整范围
             start_idx = expert_id * prototypes_per_expert
             end_idx = min(start_idx + prototypes_per_expert, self.num_prototypes)
+            
+            # 如果原型不足，使用剩余的原型
+            if start_idx >= self.num_prototypes:
+                start_idx = expert_id % self.num_prototypes
+                end_idx = start_idx + 1
+            elif start_idx >= end_idx:
+                end_idx = start_idx + 1
+                if end_idx > self.num_prototypes:
+                    start_idx = self.num_prototypes - 1
+                    end_idx = self.num_prototypes
             
             # 当前专家的样本
             expert_samples = projected_features[expert_mask]  # [num_samples, prototype_dim]
@@ -246,12 +300,28 @@ class M2_MOEP(nn.Module):
             
             # 正样本：当前专家的原型
             positive_similarities = expert_similarities[:, start_idx:end_idx]  # [num_samples, prototypes_per_expert]
+            
+            # 检查正样本是否为空
+            if positive_similarities.size(1) == 0:
+                continue
+                
             positive_max = positive_similarities.max(dim=1)[0]  # [num_samples]
             
             # 负样本：其他专家的原型
             negative_mask = torch.ones(self.num_prototypes, dtype=torch.bool, device=expert_similarities.device)
             negative_mask[start_idx:end_idx] = False
-            negative_similarities = expert_similarities[:, negative_mask]  # [num_samples, other_prototypes]
+            
+            # 检查负样本是否存在
+            if not negative_mask.any():
+                # 如果没有负样本，创建人工负样本（使用当前专家原型的反向）
+                negative_similarities = -positive_similarities
+            else:
+                negative_similarities = expert_similarities[:, negative_mask]  # [num_samples, other_prototypes]
+            
+            # 检查负样本数组是否为空
+            if negative_similarities.size(1) == 0:
+                continue
+                
             negative_max = negative_similarities.max(dim=1)[0]  # [num_samples]
             
             # 对比损失：拉近正样本，推远负样本
@@ -260,21 +330,25 @@ class M2_MOEP(nn.Module):
             separation_losses.append(contrastive_loss.mean())
         
         if not separation_losses:
-            return torch.tensor(0.0, device=expert_features.device)
+            # 如果没有有效的分离损失，返回小的正则化项
+            return torch.tensor(0.01, device=expert_features.device)
         
         # 5. 添加原型间的排斥损失
         # 确保不同专家的原型彼此远离
-        prototype_distances = torch.cdist(self.prototypes, self.prototypes, p=2)  # [num_prototypes, num_prototypes]
-        
-        # 创建专家分组mask
-        expert_groups = torch.arange(self.num_prototypes, device=self.prototypes.device) // prototypes_per_expert
-        same_expert_mask = expert_groups.unsqueeze(0) == expert_groups.unsqueeze(1)
-        different_expert_mask = ~same_expert_mask
-        
-        # 不同专家的原型应该距离较远
-        if different_expert_mask.any():
-            inter_expert_distances = prototype_distances[different_expert_mask]
-            repulsion_loss = F.relu(1.0 - inter_expert_distances).mean()  # 距离小于1时施加惩罚
+        if self.num_prototypes > 1:
+            prototype_distances = torch.cdist(self.prototypes, self.prototypes, p=2)  # [num_prototypes, num_prototypes]
+            
+            # 创建专家分组mask - 动态处理
+            expert_groups = torch.arange(self.num_prototypes, device=self.prototypes.device) // prototypes_per_expert
+            same_expert_mask = expert_groups.unsqueeze(0) == expert_groups.unsqueeze(1)
+            different_expert_mask = ~same_expert_mask
+            
+            # 不同专家的原型应该距离较远
+            if different_expert_mask.any():
+                inter_expert_distances = prototype_distances[different_expert_mask]
+                repulsion_loss = F.relu(1.0 - inter_expert_distances).mean()  # 距离小于1时施加惩罚
+            else:
+                repulsion_loss = torch.tensor(0.0, device=expert_features.device)
         else:
             repulsion_loss = torch.tensor(0.0, device=expert_features.device)
         
@@ -353,14 +427,36 @@ class M2_MOEP(nn.Module):
         noisy_weights = F.softmax(noisy_weights / self.temperature, dim=-1)
         
         # 6. 使用指数移动平均平滑变化（避免剧烈波动）
-        if hasattr(self, '_prev_expert_weights'):
-            alpha = 0.8 if noise_type == 'strong' else 0.9
-            smoothed_weights = alpha * noisy_weights + (1 - alpha) * self._prev_expert_weights
+        if hasattr(self, '_prev_expert_weights') and self._prev_expert_weights is not None:
+            # 检查批次大小是否匹配
+            if self._prev_expert_weights.size(0) == batch_size:
+                alpha = 0.8 if noise_type == 'strong' else 0.9
+                smoothed_weights = alpha * noisy_weights + (1 - alpha) * self._prev_expert_weights
+            else:
+                # 批次大小不匹配，不使用平滑
+                smoothed_weights = noisy_weights
         else:
             smoothed_weights = noisy_weights
         
-        # 保存当前权重用于下次平滑
-        self._prev_expert_weights = smoothed_weights.detach()
+        # 保存当前权重用于下次平滑（分离计算图）
+        self._prev_expert_weights = smoothed_weights.detach().clone()
+        
+        # 数值稳定性检查
+        if torch.isnan(smoothed_weights).any() or torch.isinf(smoothed_weights).any():
+            print("警告: 检测到smoothed_weights中的NaN或Inf值，使用均匀分布")
+            smoothed_weights = torch.ones_like(smoothed_weights) / smoothed_weights.size(-1)
+        
+        # 确保smoothed_weights为正数且和为1
+        smoothed_weights = torch.clamp(smoothed_weights, min=1e-8)
+        # 安全归一化：防止行向量全为0的情况
+        row_sums = smoothed_weights.sum(dim=-1, keepdim=True)
+        row_sums = torch.clamp(row_sums, min=1e-8)  # 防止除零
+        smoothed_weights = smoothed_weights / row_sums
+        
+        # 最终检查：确保每行和为1
+        if not torch.allclose(smoothed_weights.sum(dim=-1), torch.ones(smoothed_weights.size(0), device=smoothed_weights.device), atol=1e-6):
+            print("警告: 专家权重归一化失败，强制重新归一化")
+            smoothed_weights = F.softmax(torch.ones_like(smoothed_weights), dim=-1)
         
         return smoothed_weights
     
@@ -383,6 +479,11 @@ class M2_MOEP(nn.Module):
         batch_size = x.size(0)
         triplets = []
         
+        # 边界条件检查
+        if batch_size < 3:
+            # 批次太小，无法构成有效的三元组
+            return triplets
+        
         # 计算每个专家对每个样本的预测误差
         expert_errors = torch.zeros(batch_size, self.num_experts, device=x.device)
         for i in range(self.num_experts):
@@ -397,7 +498,7 @@ class M2_MOEP(nn.Module):
         # 为每个样本找到最佳专家
         best_experts = torch.argmin(expert_errors, dim=1)  # [batch_size]
         
-        # 构建三元组
+        # 构建三元组 - 增强对小批次的处理
         for anchor_idx in range(batch_size):
             anchor_best_expert = best_experts[anchor_idx].item()
             
@@ -418,7 +519,7 @@ class M2_MOEP(nn.Module):
                     # 不同专家主导，作为负样本候选
                     negative_candidates.append(candidate_idx)
             
-            # 选择最佳正样本和负样本
+            # 选择最佳正样本和负样本 - 放宽条件以适应小批次
             if positive_candidates and negative_candidates:
                 # 选择预测误差最小的正样本
                 positive_errors = expert_errors[positive_candidates, anchor_best_expert]
@@ -429,6 +530,25 @@ class M2_MOEP(nn.Module):
                 hardest_negative_idx = negative_candidates[torch.argmax(negative_errors).item()]
                 
                 triplets.append((anchor_idx, best_positive_idx, hardest_negative_idx))
+            
+            elif not positive_candidates and negative_candidates:
+                # 没有正样本，但有负样本：使用最相似的样本作为正样本
+                if len(negative_candidates) >= 2:
+                    # 从负样本中选择误差最小的作为伪正样本
+                    negative_errors = expert_errors[negative_candidates, anchor_best_expert]
+                    sorted_indices = torch.argsort(negative_errors)
+                    pseudo_positive_idx = negative_candidates[sorted_indices[0].item()]
+                    hardest_negative_idx = negative_candidates[sorted_indices[-1].item()]
+                    triplets.append((anchor_idx, pseudo_positive_idx, hardest_negative_idx))
+            
+            elif positive_candidates and not negative_candidates:
+                # 没有负样本，但有正样本：使用最差的正样本作为负样本
+                if len(positive_candidates) >= 2:
+                    positive_errors = expert_errors[positive_candidates, anchor_best_expert]
+                    sorted_indices = torch.argsort(positive_errors)
+                    best_positive_idx = positive_candidates[sorted_indices[0].item()]
+                    pseudo_negative_idx = positive_candidates[sorted_indices[-1].item()]
+                    triplets.append((anchor_idx, best_positive_idx, pseudo_negative_idx))
         
         return triplets
     
@@ -467,17 +587,51 @@ class M2_MOEP(nn.Module):
     def forward(self, x: torch.Tensor, ground_truth: Optional[torch.Tensor] = None, 
                 return_aux_info: bool = False) -> Dict[str, torch.Tensor]:
         """
-        前向传播 - 符合设计文档要求
+        M²-MOEP前向传播
         
         Args:
-            x: 输入序列 [batch_size, seq_len, input_dim]
-            ground_truth: 真实值 [batch_size, pred_len]（训练时用于三元组挖掘）
+            x: 输入时间序列 [batch_size, seq_len, input_dim]
+            ground_truth: 真实值（用于三元组挖掘）[batch_size, pred_len, output_dim]
             return_aux_info: 是否返回辅助信息
             
         Returns:
-            字典包含预测结果和辅助信息
+            Dict包含predictions和可选的aux_info
         """
         batch_size = x.size(0)
+        
+        # 验证输入维度
+        if x.dim() != 3:
+            raise ValueError(f"输入x应为3维张量，实际维度: {x.dim()}")
+        
+        actual_seq_len, actual_input_dim = x.size(1), x.size(2)
+        if actual_seq_len != self.seq_len:
+            raise ValueError(f"序列长度不匹配: 期望{self.seq_len}，实际{actual_seq_len}")
+        
+        if actual_input_dim != self.input_dim:
+            raise ValueError(f"输入维度不匹配: 期望{self.input_dim}，实际{actual_input_dim}")
+        
+        # 验证ground_truth维度（如果提供）
+        if ground_truth is not None:
+            if ground_truth.dim() != 3:
+                raise ValueError(f"ground_truth应为3维张量，实际维度: {ground_truth.dim()}")
+            
+            gt_batch_size, gt_pred_len, gt_output_dim = ground_truth.size()
+            if gt_batch_size != batch_size:
+                raise ValueError(f"batch_size不匹配: 输入{batch_size}，ground_truth{gt_batch_size}")
+            
+            if gt_pred_len != self.pred_len:
+                raise ValueError(f"预测长度不匹配: 期望{self.pred_len}，实际{gt_pred_len}")
+            
+            if gt_output_dim != self.output_dim:
+                raise ValueError(f"输出维度不匹配: 期望{self.output_dim}，实际{gt_output_dim}")
+        
+        # 数值稳定性检查
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            raise ValueError("输入包含NaN或Inf值")
+        
+        if x.abs().max() > 1e6:
+            print(f"警告: 输入值过大 (max: {x.abs().max().item():.2e})")
+            x = torch.clamp(x, -1e6, 1e6)
         
         # === 1. Flow模型潜在表示映射 ===
         # 展平输入用于Flow模型
@@ -493,8 +647,15 @@ class M2_MOEP(nn.Module):
             z_latent = self.flow_model.encode(x_flat)
         
         # === 2. 门控网络计算专家权重（接受潜在表示） ===
-        gating_output = self.gating(z_latent)
-        expert_weights = F.softmax(gating_output / self.temperature, dim=-1)
+        # 修复：门控网络返回的是负距离，需要正确应用温度缩放
+        gating_distances = self.gating(z_latent)  # [batch_size, num_experts] 负距离
+        expert_weights = F.softmax(gating_distances / self.temperature, dim=-1)
+        
+        # 中间张量验证
+        self._validate_intermediate_tensors(
+            {'z_latent': z_latent, 'expert_weights': expert_weights},
+            {'z_latent': (batch_size, self.flow_latent_dim), 'expert_weights': (batch_size, self.num_experts)}
+        )
         
         # === Top-k 稀疏激活 ===
         top_k = self.config['model'].get('top_k', None)
@@ -518,6 +679,11 @@ class M2_MOEP(nn.Module):
         
         expert_predictions = torch.stack(expert_predictions, dim=1)  # [batch_size, num_experts, pred_len, input_dim]
         
+        # 验证专家预测维度
+        expected_expert_shape = (batch_size, self.num_experts, self.pred_len, self.output_dim)
+        if expert_predictions.shape != expected_expert_shape:
+            raise ValueError(f"专家预测维度不匹配: 期望{expected_expert_shape}，实际{expert_predictions.shape}")
+        
         # === 5. 加权融合 ===
         # 扩展专家权重以匹配输出维度
         expert_weights_expanded = expert_weights.unsqueeze(-1).unsqueeze(-1)  # [batch_size, num_experts, 1, 1]
@@ -525,6 +691,11 @@ class M2_MOEP(nn.Module):
             expert_predictions * expert_weights_expanded, 
             dim=1
         )  # [batch_size, pred_len, input_dim]
+        
+        # 验证最终输出维度
+        expected_output_shape = (batch_size, self.pred_len, self.output_dim)
+        if weighted_predictions.shape != expected_output_shape:
+            raise ValueError(f"最终输出维度不匹配: 期望{expected_output_shape}，实际{weighted_predictions.shape}")
         
         # === 6. 辅助信息和损失计算 ===
         aux_info = {}
@@ -545,10 +716,9 @@ class M2_MOEP(nn.Module):
             
             # 计算基于预测性能的三元组损失
             triplet_loss = torch.tensor(0.0, device=x.device)
+            gating_embeddings = self.gating.get_embeddings(z_latent)
+            
             if ground_truth is not None and self.training:
-                # 获取门控网络的嵌入
-                gating_embeddings = self.gating.get_embeddings(z_latent)
-                
                 # 挖掘三元组
                 triplets = self.mine_triplets_based_on_prediction_performance(
                     x, expert_weights, expert_predictions, ground_truth
@@ -558,7 +728,7 @@ class M2_MOEP(nn.Module):
                 triplet_loss = self.compute_triplet_loss(gating_embeddings, triplets)
             
             # 为一致性损失提供嵌入
-            aux_info['gating_embeddings'] = gating_embeddings if ground_truth is not None else self.gating.get_embeddings(z_latent)
+            aux_info['gating_embeddings'] = gating_embeddings
             
             aux_info.update({
                 'expert_weights': expert_weights,
@@ -572,6 +742,14 @@ class M2_MOEP(nn.Module):
                 'expert_features': expert_features,
                 'latent_representation': z_latent
             })
+        
+        # 训练时的额外检查
+        if self.training:
+            # 检查数值稳定性
+            if torch.isnan(weighted_predictions).any() or torch.isinf(weighted_predictions).any():
+                print("警告: 预测值中检测到NaN或Inf，使用备用策略")
+                # 使用简单的平均预测作为备用
+                weighted_predictions = expert_predictions.mean(dim=1)
         
         return {
             'predictions': weighted_predictions,

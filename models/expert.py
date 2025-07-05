@@ -203,16 +203,38 @@ class FFTmsMambaExpert(nn.Module):
         if x.size(1) == target_len:
             return x
         
-        # 使用线性插值上采样
+        # 使用线性插值上采样，兼容不同PyTorch版本
         x_permuted = x.permute(0, 2, 1)  # [B, d_model, seq_len]
-        upsampled = F.interpolate(x_permuted, size=target_len, mode='linear', align_corners=False)
+        
+        # 检查PyTorch版本兼容性
+        try:
+            # 尝试使用linear模式（PyTorch >= 1.9推荐）
+            upsampled = F.interpolate(x_permuted, size=target_len, mode='linear', align_corners=False)
+        except (RuntimeError, ValueError):
+            # 回退到nearest模式（兼容所有版本）
+            print("警告: linear插值不支持，使用nearest模式")
+            upsampled = F.interpolate(x_permuted, size=target_len, mode='nearest')
+        
         return upsampled.permute(0, 2, 1)  # [B, target_len, d_model]
 
     def _check_mamba_availability(self):
-        """检查Mamba是否可用"""
+        """检查Mamba是否可用 - 支持CPU和CUDA"""
+        if not MAMBA_AVAILABLE:
+            return False
+        
         try:
-            import mamba_ssm
-            # 如果没有CUDA，使用CPU模式
-            return torch.cuda.is_available()
-        except ImportError:
+            # 测试Mamba初始化（支持CPU）
+            from mamba_ssm import Mamba
+            test_mamba = Mamba(
+                d_model=16,
+                d_state=8,
+                d_conv=2,
+                expand=1,
+            )
+            # 简单测试运行
+            test_input = torch.randn(1, 10, 16)
+            _ = test_mamba(test_input)
+            return True
+        except Exception as e:
+            print(f"Mamba不可用: {e}")
             return False

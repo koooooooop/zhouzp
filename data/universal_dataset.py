@@ -272,19 +272,35 @@ class UniversalDataModule:
                     num_coupling_layers=6
                 )
                 
-                # 加载权重
-                checkpoint = torch.load(flow_model_path, map_location='cpu')
-                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                    self.flow_model.load_state_dict(checkpoint['model_state_dict'])
-                else:
-                    self.flow_model.load_state_dict(checkpoint)
+                # 尝试加载权重，如果维度不匹配则重新训练
+                try:
+                    checkpoint = torch.load(flow_model_path, map_location='cpu')
+                    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                        # 检查维度是否匹配
+                        saved_input_dim = checkpoint.get('input_dim', None)
+                        saved_latent_dim = checkpoint.get('latent_dim', None)
+                        
+                        if saved_input_dim == input_dim and saved_latent_dim == latent_dim:
+                            self.flow_model.load_state_dict(checkpoint['model_state_dict'])
+                            print(f"Flow模型加载成功: {flow_model_path}")
+                        else:
+                            print(f"Flow模型维度不匹配 (保存: {saved_input_dim}x{saved_latent_dim}, 需要: {input_dim}x{latent_dim})")
+                            print("将使用未预训练的Flow模型")
+                            self.flow_model = None
+                    else:
+                        self.flow_model.load_state_dict(checkpoint)
+                        print(f"Flow模型加载成功: {flow_model_path}")
+                        
+                except Exception as e:
+                    print(f"Flow模型加载失败，将使用未预训练的Flow模型: {e}")
+                    self.flow_model = None
                 
-                self.flow_model.eval()
-                print(f"Flow模型加载成功: {flow_model_path}")
-                print(f"  输入维度: {input_dim}, 潜在维度: {latent_dim}")
+                if self.flow_model is not None:
+                    self.flow_model.eval()
+                    print(f"  输入维度: {input_dim}, 潜在维度: {latent_dim}")
                 
             except Exception as e:
-                print(f"Flow模型加载失败: {e}")
+                print(f"Flow模型创建失败: {e}")
                 self.flow_model = None
         else:
             print(f"Flow模型文件不存在: {flow_model_path}")
@@ -347,29 +363,55 @@ class UniversalDataModule:
         return data
     
     def get_flow_reconstruction(self, x: torch.Tensor) -> torch.Tensor:
-        """获取Flow模型重构"""
+        """
+        获取Flow模型重构
+        Args:
+            x: 输入张量 [batch_size, seq_len, features]
+        Returns:
+            重构张量 [batch_size, seq_len, features] 或 None
+        """
         if self.flow_model is None:
-            return torch.empty(0)  # 返回空张量而不是零张量
+            return None
         
         try:
+            # 确保Flow模型在正确的设备上
+            if x.is_cuda and not next(self.flow_model.parameters()).is_cuda:
+                self.flow_model = self.flow_model.cuda()
+            elif not x.is_cuda and next(self.flow_model.parameters()).is_cuda:
+                self.flow_model = self.flow_model.cpu()
+            
+            # 保存原始形状
+            original_shape = x.shape
+            batch_size, seq_len, features = original_shape
+            
+            # 检查维度匹配
+            expected_input_dim = self.flow_model.input_dim
+            actual_input_dim = seq_len * features
+            
+            if expected_input_dim != actual_input_dim:
+                print(f"Flow模型维度不匹配: 期望{expected_input_dim}, 实际{actual_input_dim}")
+                return None
+            
+            # 展平输入
+            x_flat = x.view(batch_size, -1)
+            
+            # 重构 - 使用reconstruct方法
             with torch.no_grad():
-                original_shape = x.shape  # [B, seq_len, input_dim]
-                batch_size = original_shape[0]
-                
-                # 展平输入用于Flow模型
-                x_flat = x.view(batch_size, -1)  # [B, seq_len * input_dim]
-                
-                # Flow模型重构
-                x_recon_flat = self.flow_model.reconstruct(x_flat)  # [B, seq_len * input_dim]
-                
-                # 恢复原始形状
-                x_reconstructed = x_recon_flat.view(original_shape)  # [B, seq_len, input_dim]
-                
-                return x_reconstructed
-                
+                x_recon_flat = self.flow_model.reconstruct(x_flat)
+            
+            # 数值稳定性检查
+            if torch.isnan(x_recon_flat).any() or torch.isinf(x_recon_flat).any():
+                print("Flow重构结果包含NaN或Inf")
+                return None
+            
+            # 恢复原始形状
+            x_recon = x_recon_flat.view(original_shape)
+            
+            return x_recon
+            
         except Exception as e:
             print(f"Flow重构失败: {e}")
-            return torch.empty(0)  # 返回空张量表示失败
+            return None
 
     def _generate_synthetic_data(self) -> pd.DataFrame:
         """生成合成数据"""

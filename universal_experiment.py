@@ -178,12 +178,17 @@ class UniversalExperiment:
         self.logger.info(f"Flow模型未找到，将自动预训练: {flow_model_path}")
         
         try:
-            # 导入预训练函数
-            from pretrain_flow import pretrain_flow
-            pretrain_flow(config)
-            self.logger.info("Flow模型预训练完成")
+            # 导入预训练函数 - 修复函数名
+            from pretrain_flow import pretrain_flow_model
+            success = pretrain_flow_model(config, flow_model_path)
+            if success:
+                self.logger.info("Flow模型预训练完成")
+            else:
+                self.logger.error("Flow模型预训练失败")
         except Exception as e:
             self.logger.error(f"Flow模型预训练失败: {e}")
+            # 即使预训练失败，也继续训练（不使用Flow重构）
+            self.logger.warning("将继续训练，但不使用Flow重构损失")
 
     def _find_actual_data_path(self, dataset_name: str) -> str:
         """查找实际的数据路径"""

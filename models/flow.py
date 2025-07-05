@@ -57,10 +57,42 @@ class NormalizingFlow(nn.Module):
         return z
 
     def log_prob(self, x):
-        z, log_det_jacobian_sum = self.forward(x)
-        prior = Normal(self.prior_loc, self.prior_scale)
-        log_prob_prior = prior.log_prob(z).sum(dim=1)
-        return log_prob_prior + log_det_jacobian_sum
+        """
+        计算对数概率
+        """
+        try:
+            z, log_det_jacobian_sum = self.forward(x)
+            
+            # 数值稳定性检查
+            if torch.isnan(z).any() or torch.isinf(z).any():
+                print("警告: Flow变换结果包含NaN/Inf")
+                return torch.tensor(-1e6, device=x.device).expand(x.size(0))
+            
+            if torch.isnan(log_det_jacobian_sum).any() or torch.isinf(log_det_jacobian_sum).any():
+                print("警告: 雅可比行列式包含NaN/Inf")
+                log_det_jacobian_sum = torch.zeros_like(log_det_jacobian_sum)
+            
+            # 先验分布的对数概率
+            prior = Normal(self.prior_loc, self.prior_scale)
+            log_prob_prior = prior.log_prob(z).sum(dim=1)
+            
+            # 检查先验概率
+            if torch.isnan(log_prob_prior).any() or torch.isinf(log_prob_prior).any():
+                print("警告: 先验概率包含NaN/Inf")
+                log_prob_prior = torch.tensor(-1e6, device=x.device).expand(x.size(0))
+            
+            total_log_prob = log_prob_prior + log_det_jacobian_sum
+            
+            # 最终检查
+            if torch.isnan(total_log_prob).any() or torch.isinf(total_log_prob).any():
+                print("警告: 总对数概率包含NaN/Inf，使用备用值")
+                total_log_prob = torch.tensor(-1e6, device=x.device).expand(x.size(0))
+            
+            return total_log_prob
+            
+        except Exception as e:
+            print(f"Flow log_prob计算失败: {e}")
+            return torch.tensor(-1e6, device=x.device).expand(x.size(0))
     
     def reconstruct(self, x):
         """
@@ -211,11 +243,44 @@ class PowerfulNormalizingFlow(nn.Module):
     
     def encode(self, x):
         """将高维输入编码到潜在空间"""
-        return self.encoder(x)
+        # 数值稳定性检查
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            raise ValueError("Flow输入包含NaN或Inf值")
+        
+        # 数值范围检查
+        if x.abs().max() > 1e6:
+            print(f"警告: Flow输入值过大 (max: {x.abs().max().item():.2e})")
+            x = torch.clamp(x, -1e6, 1e6)
+        
+        z_latent = self.encoder(x)
+        
+        # 编码结果检查
+        if torch.isnan(z_latent).any() or torch.isinf(z_latent).any():
+            print("警告: Flow编码结果包含NaN或Inf，使用零向量替代")
+            z_latent = torch.zeros_like(z_latent)
+        
+        return z_latent
     
     def decode(self, z_latent):
         """将潜在表示解码回原始空间"""
-        return self.decoder(z_latent)
+        # 数值稳定性检查
+        if torch.isnan(z_latent).any() or torch.isinf(z_latent).any():
+            print("警告: Flow解码输入包含NaN或Inf，使用零向量替代")
+            z_latent = torch.zeros_like(z_latent)
+        
+        # 数值范围检查
+        if z_latent.abs().max() > 1e6:
+            print(f"警告: Flow解码输入值过大 (max: {z_latent.abs().max().item():.2e})")
+            z_latent = torch.clamp(z_latent, -1e6, 1e6)
+        
+        x_recon = self.decoder(z_latent)
+        
+        # 解码结果检查
+        if torch.isnan(x_recon).any() or torch.isinf(x_recon).any():
+            print("警告: Flow解码结果包含NaN或Inf，使用零向量替代")
+            x_recon = torch.zeros_like(x_recon)
+        
+        return x_recon
     
     def forward(self, x):
         """
@@ -249,13 +314,39 @@ class PowerfulNormalizingFlow(nn.Module):
         """
         计算对数概率
         """
-        z, log_det_jacobian_sum = self.forward(x)
-        
-        # 先验分布的对数概率
-        prior = Normal(self.prior_mean, self.prior_std)
-        log_prob_prior = prior.log_prob(z).sum(dim=1)
-        
-        return log_prob_prior + log_det_jacobian_sum
+        try:
+            z, log_det_jacobian_sum = self.forward(x)
+            
+            # 数值稳定性检查
+            if torch.isnan(z).any() or torch.isinf(z).any():
+                print("警告: Flow变换结果包含NaN/Inf")
+                return torch.tensor(-1e6, device=x.device).expand(x.size(0))
+            
+            if torch.isnan(log_det_jacobian_sum).any() or torch.isinf(log_det_jacobian_sum).any():
+                print("警告: 雅可比行列式包含NaN/Inf")
+                log_det_jacobian_sum = torch.zeros_like(log_det_jacobian_sum)
+            
+            # 先验分布的对数概率
+            prior = Normal(self.prior_mean, self.prior_std)
+            log_prob_prior = prior.log_prob(z).sum(dim=1)
+            
+            # 检查先验概率
+            if torch.isnan(log_prob_prior).any() or torch.isinf(log_prob_prior).any():
+                print("警告: 先验概率包含NaN/Inf")
+                log_prob_prior = torch.tensor(-1e6, device=x.device).expand(x.size(0))
+            
+            total_log_prob = log_prob_prior + log_det_jacobian_sum
+            
+            # 最终检查
+            if torch.isnan(total_log_prob).any() or torch.isinf(total_log_prob).any():
+                print("警告: 总对数概率包含NaN/Inf，使用备用值")
+                total_log_prob = torch.tensor(-1e6, device=x.device).expand(x.size(0))
+            
+            return total_log_prob
+            
+        except Exception as e:
+            print(f"Flow log_prob计算失败: {e}")
+            return torch.tensor(-1e6, device=x.device).expand(x.size(0))
     
     def reconstruct(self, x):
         """

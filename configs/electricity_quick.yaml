@@ -1,0 +1,77 @@
+model:
+  input_dim: 321
+  output_dim: 321
+  hidden_dim: 256
+  num_experts: 4
+  expert_hidden_dim: 128
+  embedding_dim: 128
+  dropout: 0.1
+  activation: gelu
+  seq_len: 96
+  pred_len: 96
+  top_k: 3
+  expert_params:
+    mamba_d_model: 256
+    mamba_scales: [1, 2, 4]
+  flow:
+    latent_dim: 256
+    use_pretrained: true
+    hidden_dim: 256
+    num_coupling_layers: 6
+  triplet:
+    margin: 0.5
+    mining_strategy: batch_hard
+    loss_weight: 1.0
+    performance_window: 100
+  diversity:
+    prototype_dim: 64
+    num_prototypes: 8
+    diversity_weight: 0.1
+    force_diversity: true
+  temperature:
+    initial: 1.0
+    min: 0.1
+    max: 10.0
+    decay: 0.95
+    schedule: exponential
+
+data:
+  data_path: dataset/electricity_321个客户的每小时用电量/electricity.csv
+  seq_len: 96
+  pred_len: 96
+  batch_size: 16
+  num_workers: 2
+  pin_memory: true
+  train_ratio: 0.7
+  val_ratio: 0.2
+  test_ratio: 0.1
+  scaler_type: standard
+  normalize: true
+
+training:
+  epochs: 3
+  batch_size: 16
+  learning_rate: 0.0001
+  optimizer: Adam
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  min_lr: 0.000001
+  patience: 10
+  flow_model_path: flow_model_default.pth
+  triplet_margin: 0.5
+  use_reconstruction_loss: true
+  use_consistency_loss: true
+  use_load_balancing: true
+  consistency_temperature: 0.1
+  aux_loss_weight: 0.01
+  loss_weights:
+    init_sigma_rc: 1.0
+    init_sigma_cl: 1.0
+    init_sigma_pr: 1.0
+    init_sigma_consistency: 1.0
+    init_sigma_balance: 1.0
+
+evaluation:
+  metrics: [mse, mae, mape]
+  save_predictions: true
+  save_expert_analysis: true 

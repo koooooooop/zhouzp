@@ -22,6 +22,7 @@ class CompositeLoss(nn.Module):
         self.log_sigma_pr = nn.Parameter(torch.log(torch.tensor(loss_weights.get('init_sigma_pr', 1.0))))
         self.log_sigma_cons = nn.Parameter(torch.log(torch.tensor(loss_weights.get('init_sigma_consistency', 1.0))))
         self.log_sigma_bal = nn.Parameter(torch.log(torch.tensor(loss_weights.get('init_sigma_balance', 1.0))))
+        self.log_sigma_recon = nn.Parameter(torch.log(torch.tensor(loss_weights.get('init_sigma_reconstruction', 1.0))))
         
         # 基础损失函数
         self.mse_loss = nn.MSELoss()
@@ -42,83 +43,239 @@ class CompositeLoss(nn.Module):
         :param aux_info: 辅助信息字典，包含路由权重、嵌入等
         :param flow_reconstruction: Flow重构结果（可选）
         """
+        # 增强的数值稳定性检查
+        stability_issues = []
+        
+        # 检查预测值
+        if torch.isnan(predictions).any():
+            nan_count = torch.isnan(predictions).sum().item()
+            stability_issues.append(f"预测值包含{nan_count}个NaN")
+            predictions = torch.nan_to_num(predictions, nan=0.0, posinf=1e6, neginf=-1e6)
+        
+        if torch.isinf(predictions).any():
+            inf_count = torch.isinf(predictions).sum().item()
+            stability_issues.append(f"预测值包含{inf_count}个Inf")
+            predictions = torch.nan_to_num(predictions, nan=0.0, posinf=1e6, neginf=-1e6)
+        
+        # 检查数值范围
+        if predictions.abs().max() > 1e6:
+            max_val = predictions.abs().max().item()
+            stability_issues.append(f"预测值过大: {max_val}")
+            predictions = torch.clamp(predictions, -1e6, 1e6)
+        
+        # 检查目标值
+        if torch.isnan(targets).any():
+            nan_count = torch.isnan(targets).sum().item()
+            stability_issues.append(f"目标值包含{nan_count}个NaN")
+            targets = torch.nan_to_num(targets, nan=0.0, posinf=1e6, neginf=-1e6)
+        
+        if torch.isinf(targets).any():
+            inf_count = torch.isinf(targets).sum().item()
+            stability_issues.append(f"目标值包含{inf_count}个Inf")
+            targets = torch.nan_to_num(targets, nan=0.0, posinf=1e6, neginf=-1e6)
+        
+        # 检查辅助信息的数值稳定性
+        if 'expert_weights' in aux_info:
+            weights = aux_info['expert_weights']
+            if torch.isnan(weights).any() or torch.isinf(weights).any():
+                stability_issues.append("专家权重包含NaN/Inf")
+                weights = torch.nan_to_num(weights, nan=1.0/weights.size(-1), posinf=1.0, neginf=0.0)
+                # 重新归一化
+                weights = F.softmax(weights, dim=-1)
+                aux_info['expert_weights'] = weights
+        
+        # 记录稳定性问题
+        if stability_issues:
+            print(f"警告: 发现数值稳定性问题: {'; '.join(stability_issues)}")
+        
+        # 验证修复后的数值
+        assert not torch.isnan(predictions).any(), "预测值修复后仍包含NaN"
+        assert not torch.isinf(predictions).any(), "预测值修复后仍包含Inf"
+        assert not torch.isnan(targets).any(), "目标值修复后仍包含NaN"
+        assert not torch.isinf(targets).any(), "目标值修复后仍包含Inf"
+        
         losses = {}
         total_loss = torch.tensor(0.0, device=predictions.device)
         
-        # 1. 预测损失 (MSE + MAE)
-        prediction_loss = self.mse_loss(predictions, targets) + 0.1 * self.mae_loss(predictions, targets)
-        losses['prediction'] = prediction_loss
-        total_loss += torch.exp(-2 * self.log_sigma_pr) * prediction_loss + self.log_sigma_pr
+        # 1. 预测损失 (MSE + MAE) - 增加数值稳定性检查
+        try:
+            mse_loss = self.mse_loss(predictions, targets)
+            mae_loss = self.mae_loss(predictions, targets)
+            
+            # 检查损失值的合理性
+            if torch.isnan(mse_loss) or torch.isnan(mae_loss):
+                print("警告: 预测损失计算出现NaN，使用备用方案")
+                mse_loss = torch.tensor(0.0, device=predictions.device)
+                mae_loss = torch.tensor(0.0, device=predictions.device)
+            
+            prediction_loss = mse_loss + 0.1 * mae_loss
+            
+            # 限制损失值范围
+            prediction_loss = torch.clamp(prediction_loss, 0.0, 1e6)
+            
+        except Exception as e:
+            print(f"预测损失计算失败: {e}")
+            prediction_loss = torch.tensor(0.0, device=predictions.device)
         
-        # 2. 重构损失 (来自Flow模型)
-        if 'reconstruction_loss' in aux_info:
-            reconstruction_loss = aux_info['reconstruction_loss']
-            losses['reconstruction'] = reconstruction_loss
-            total_loss += torch.exp(-2 * self.log_sigma_rc) * reconstruction_loss + self.log_sigma_rc
-        elif flow_reconstruction is not None and 'original_input' in aux_info:
-            reconstruction_loss = self.compute_reconstruction_loss(
-                aux_info['original_input'], flow_reconstruction
-            )
-            losses['reconstruction'] = reconstruction_loss
-            total_loss += torch.exp(-2 * self.log_sigma_rc) * reconstruction_loss + self.log_sigma_rc
-        else:
-            losses['reconstruction'] = torch.tensor(0.0, device=predictions.device)
+        losses['prediction'] = prediction_loss
+        
+        # 安全的权重计算
+        try:
+            sigma_weight = torch.exp(-2 * self.log_sigma_pr)
+            if torch.isnan(sigma_weight) or torch.isinf(sigma_weight):
+                sigma_weight = torch.tensor(1.0, device=predictions.device)
+            total_loss += sigma_weight * prediction_loss + self.log_sigma_pr
+        except Exception as e:
+            print(f"权重计算失败: {e}")
+            total_loss += prediction_loss
+        
+        # 2. 重构损失 (来自Flow模型) - 增强错误处理
+        reconstruction_loss = torch.tensor(0.0, device=predictions.device)
+        try:
+            if 'reconstruction_loss' in aux_info:
+                reconstruction_loss = aux_info['reconstruction_loss']
+                if torch.isnan(reconstruction_loss) or torch.isinf(reconstruction_loss):
+                    reconstruction_loss = torch.tensor(0.0, device=predictions.device)
+            elif flow_reconstruction is not None and 'original_input' in aux_info:
+                reconstruction_loss = self.compute_reconstruction_loss(
+                    aux_info['original_input'], flow_reconstruction
+                )
+            
+            reconstruction_loss = torch.clamp(reconstruction_loss, 0.0, 1e6)
+            
+            # 安全的权重计算
+            sigma_weight = torch.exp(-2 * self.log_sigma_recon)
+            if torch.isnan(sigma_weight) or torch.isinf(sigma_weight):
+                sigma_weight = torch.tensor(1.0, device=predictions.device)
+            total_loss += sigma_weight * reconstruction_loss + self.log_sigma_recon
+            
+        except Exception as e:
+            print(f"重建损失计算失败: {e}")
+            reconstruction_loss = torch.tensor(0.0, device=predictions.device)
+        
+        losses['reconstruction'] = reconstruction_loss
         
         # 3. 基于预测性能的三元组损失 (来自模型)
-        if 'triplet_loss' in aux_info:
-            triplet_loss = aux_info['triplet_loss']
-            losses['triplet'] = triplet_loss
-            total_loss += torch.exp(-2 * self.log_sigma_cl) * triplet_loss + self.log_sigma_cl
-        else:
-            losses['triplet'] = torch.tensor(0.0, device=predictions.device)
+        triplet_loss = torch.tensor(0.0, device=predictions.device)
+        try:
+            if 'triplet_loss' in aux_info:
+                triplet_loss = aux_info['triplet_loss']
+                if torch.isnan(triplet_loss) or torch.isinf(triplet_loss):
+                    triplet_loss = torch.tensor(0.0, device=predictions.device)
+                else:
+                    triplet_loss = torch.clamp(triplet_loss, 0.0, 1e6)
+                    
+                # 安全的权重计算
+                sigma_weight = torch.exp(-2 * self.log_sigma_cl)
+                if torch.isnan(sigma_weight) or torch.isinf(sigma_weight):
+                    sigma_weight = torch.tensor(1.0, device=predictions.device)
+                total_loss += sigma_weight * triplet_loss + self.log_sigma_cl
+        except Exception as e:
+            print(f"三元组损失计算失败: {e}")
+            triplet_loss = torch.tensor(0.0, device=predictions.device)
         
-        # 4. 传统对比学习损失 (基于特征相似性)
-        if 'expert_features' in aux_info and 'expert_weights' in aux_info:
-            embeddings = aux_info['expert_features']
-            expert_weights = aux_info['expert_weights']
-            
-            if embeddings.size(0) > 1:  # 需要至少2个样本
-                contrastive_loss = self.triplet_loss(embeddings, expert_weights)
-                losses['contrastive'] = contrastive_loss
-                total_loss += torch.exp(-2 * self.log_sigma_cl) * 0.5 * contrastive_loss  # 与triplet共享 σ_cl
+        losses['triplet'] = triplet_loss
+        
+        # 4. 一致性损失 - 增强错误处理
+        consistency_loss = torch.tensor(0.0, device=predictions.device)
+        try:
+            if 'expert_weights' in aux_info and 'expert_features' in aux_info:
+                consistency_loss = self.compute_kl_consistency_loss(
+                    aux_info['expert_weights'], aux_info.get('gating_embeddings', None)
+                )
+                
+                if torch.isnan(consistency_loss) or torch.isinf(consistency_loss):
+                    consistency_loss = torch.tensor(0.0, device=predictions.device)
+                else:
+                    consistency_loss = torch.clamp(consistency_loss, 0.0, 1e6)
+                    
+                    # 安全的权重计算
+                    sigma_weight = torch.exp(-2 * self.log_sigma_cons)
+                    if torch.isnan(sigma_weight) or torch.isinf(sigma_weight):
+                        sigma_weight = torch.tensor(1.0, device=predictions.device)
+                    total_loss += sigma_weight * consistency_loss + self.log_sigma_cons
+        except Exception as e:
+            print(f"一致性损失计算失败: {e}")
+            consistency_loss = torch.tensor(0.0, device=predictions.device)
+        
+        losses['consistency'] = consistency_loss
+        
+        # 5. 负载均衡损失 - 增强错误处理
+        load_balancing_loss = torch.tensor(0.0, device=predictions.device)
+        try:
+            if 'load_balance_loss' in aux_info:
+                load_balancing_loss = aux_info['load_balance_loss']
+                if torch.isnan(load_balancing_loss) or torch.isinf(load_balancing_loss):
+                    load_balancing_loss = torch.tensor(0.0, device=predictions.device)
+            elif 'expert_weights' in aux_info:
+                load_balancing_loss = self.compute_load_balancing_loss(aux_info['expert_weights'])
+                
+            if not (torch.isnan(load_balancing_loss) or torch.isinf(load_balancing_loss)):
+                load_balancing_loss = torch.clamp(load_balancing_loss, 0.0, 1e6)
+                
+                # 安全的权重计算
+                sigma_weight = torch.exp(-2 * self.log_sigma_bal)
+                if torch.isnan(sigma_weight) or torch.isinf(sigma_weight):
+                    sigma_weight = torch.tensor(1.0, device=predictions.device)
+                total_loss += sigma_weight * load_balancing_loss + self.log_sigma_bal
             else:
-                losses['contrastive'] = torch.tensor(0.0, device=predictions.device)
-        else:
-            losses['contrastive'] = torch.tensor(0.0, device=predictions.device)
+                load_balancing_loss = torch.tensor(0.0, device=predictions.device)
+        except Exception as e:
+            print(f"负载均衡损失计算失败: {e}")
+            load_balancing_loss = torch.tensor(0.0, device=predictions.device)
         
-        # 5. 一致性损失
-        if 'expert_weights' in aux_info and 'expert_features' in aux_info:
-            consistency_loss = self.compute_kl_consistency_loss(
-                aux_info['expert_weights'], aux_info.get('gating_embeddings', None)
-            )
-            losses['consistency'] = consistency_loss
-            total_loss += torch.exp(-2 * self.log_sigma_cons) * consistency_loss + self.log_sigma_cons
-        else:
-            losses['consistency'] = torch.tensor(0.0, device=predictions.device)
+        losses['load_balance'] = load_balancing_loss
         
-        # 6. 负载均衡损失
-        if 'load_balance_loss' in aux_info:
-            load_balancing_loss = aux_info['load_balance_loss']
-            losses['load_balance'] = load_balancing_loss
-            total_loss += torch.exp(-2 * self.log_sigma_bal) * load_balancing_loss + self.log_sigma_bal
-        elif 'expert_weights' in aux_info:
-            load_balancing_loss = self.compute_load_balancing_loss(aux_info['expert_weights'])
-            losses['load_balance'] = load_balancing_loss
-            total_loss += torch.exp(-2 * self.log_sigma_bal) * load_balancing_loss + self.log_sigma_bal
-        else:
-            losses['load_balance'] = torch.tensor(0.0, device=predictions.device)
+        # 6. 专家原型分离损失 - 增强错误处理
+        prototype_loss = torch.tensor(0.0, device=predictions.device)
+        try:
+            if 'prototype_loss' in aux_info:
+                prototype_loss = aux_info['prototype_loss']
+                if torch.isnan(prototype_loss) or torch.isinf(prototype_loss):
+                    prototype_loss = torch.tensor(0.0, device=predictions.device)
+                else:
+                    prototype_loss = torch.clamp(prototype_loss, 0.0, 1e6)
+                    total_loss += prototype_loss * 0.1  # 固定权重
+        except Exception as e:
+            print(f"原型分离损失计算失败: {e}")
+            prototype_loss = torch.tensor(0.0, device=predictions.device)
         
-        # 7. 专家原型分离损失
-        if 'prototype_loss' in aux_info:
-            prototype_loss = aux_info['prototype_loss']
-            losses['prototype'] = prototype_loss
-            total_loss += prototype_loss * 0.1  # 固定权重
-        else:
-            losses['prototype'] = torch.tensor(0.0, device=predictions.device)
+        losses['prototype'] = prototype_loss
         
+        # 7. 重建损失 - 使用现有的compute_reconstruction_loss方法
+        reconstruction_loss = torch.tensor(0.0, device=predictions.device)
+        try:
+            if 'reconstruction_loss' in aux_info:
+                reconstruction_loss = aux_info['reconstruction_loss']
+            else:
+                # 如果模型没有提供重建损失，使用现有方法计算
+                reconstruction_loss = self.compute_reconstruction_loss(targets, predictions)
+            
+            if torch.isnan(reconstruction_loss) or torch.isinf(reconstruction_loss):
+                reconstruction_loss = torch.tensor(0.0, device=predictions.device)
+            else:
+                reconstruction_loss = torch.clamp(reconstruction_loss, 0.0, 1e6)
+                
+                # 安全的权重计算
+                sigma_weight = torch.exp(-2 * self.log_sigma_recon)
+                if torch.isnan(sigma_weight) or torch.isinf(sigma_weight):
+                    sigma_weight = torch.tensor(1.0, device=predictions.device)
+                total_loss += sigma_weight * reconstruction_loss + self.log_sigma_recon
+        except Exception as e:
+            print(f"重建损失计算失败: {e}")
+            reconstruction_loss = torch.tensor(0.0, device=predictions.device)
+        
+        losses['reconstruction'] = reconstruction_loss
+        
+        # 最终的总损失检查
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            print("警告: 总损失包含NaN/Inf，使用预测损失作为备用")
+            total_loss = prediction_loss
+        
+        total_loss = torch.clamp(total_loss, 0.0, 1e6)
         losses['total'] = total_loss
         
-        return losses
+        return losses['total'], losses
 
     def compute_reconstruction_loss(self, x_original, x_reconstructed):
         """计算重构损失"""

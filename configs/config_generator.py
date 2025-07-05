@@ -104,7 +104,7 @@ class ConfigGenerator:
         'electricity': {
             'description': '321个客户的每小时用电量数据',
             'expected_features': 321,
-            'data_path': 'dataset/electricity_*',  # 使用通配符模式
+            'data_path': 'dataset/electricity_321个客户的每小时用电量/electricity.csv',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -112,7 +112,7 @@ class ConfigGenerator:
         'traffic': {
             'description': '862个传感器测量的每小时道路占用率',
             'expected_features': 862,
-            'data_path': 'dataset/traffic_*',
+            'data_path': 'dataset/traffic_862个传感器测量的每小时道路占用率/traffic.csv',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -120,15 +120,39 @@ class ConfigGenerator:
         'weather': {
             'description': '气象站21个气象因子数据',
             'expected_features': 21,
-            'data_path': 'dataset/weather_*',
+            'data_path': 'dataset/weather_气象站_21个气象因子/weather.csv',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
         },
-        'ETT-small': {
+        'ETTh1': {
             'description': '7个因素的变压器温度变化',
             'expected_features': 7,
-            'data_path': 'dataset/ETT-small_*',
+            'data_path': 'dataset/ETT-small_7个因素的变压器温度变化/ETTh1.csv',
+            'seq_len': 96,
+            'pred_len': 96,
+            'scaler_type': 'standard'
+        },
+        'ETTh2': {
+            'description': '7个因素的变压器温度变化',
+            'expected_features': 7,
+            'data_path': 'dataset/ETT-small_7个因素的变压器温度变化/ETTh2.csv',
+            'seq_len': 96,
+            'pred_len': 96,
+            'scaler_type': 'standard'
+        },
+        'ETTm1': {
+            'description': '7个因素的变压器温度变化',
+            'expected_features': 7,
+            'data_path': 'dataset/ETT-small_7个因素的变压器温度变化/ETTm1.csv',
+            'seq_len': 96,
+            'pred_len': 96,
+            'scaler_type': 'standard'
+        },
+        'ETTm2': {
+            'description': '7个因素的变压器温度变化',
+            'expected_features': 7,
+            'data_path': 'dataset/ETT-small_7个因素的变压器温度变化/ETTm2.csv',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -136,7 +160,7 @@ class ConfigGenerator:
         'exchange_rate': {
             'description': '8个国家的汇率变化',
             'expected_features': 8,
-            'data_path': 'dataset/exchange_rate_*',
+            'data_path': 'dataset/exchange_rate_8个国家的汇率变化/exchange_rate.csv',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -144,7 +168,7 @@ class ConfigGenerator:
         'illness': {
             'description': '流感患者比例和数量',
             'expected_features': 7,
-            'data_path': 'dataset/illness_*',
+            'data_path': 'dataset/illness_流感患者比例和数量/national_illness.csv',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -152,7 +176,7 @@ class ConfigGenerator:
         'Solar': {
             'description': '137个发电站发电量',
             'expected_features': 137,
-            'data_path': 'dataset/Solar_*',
+            'data_path': 'dataset/Solar_137个发电站发电量/solar_AL.csv',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -160,7 +184,7 @@ class ConfigGenerator:
         'PEMS': {
             'description': '5分钟窗口收集的公共交通网络数据',
             'expected_features': 307,
-            'data_path': 'dataset/PEMS_*',
+            'data_path': 'dataset/PEMS_5分钟窗口收集的公共交通网络数据/PEMS04.npz',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -195,6 +219,7 @@ class ConfigGenerator:
         config['model']['pred_len'] = dataset_config.get('pred_len', 96)
         
         # 更新数据配置
+        config['data']['dataset_name'] = dataset_name
         config['data']['data_path'] = dataset_config['data_path']
         config['data']['seq_len'] = dataset_config.get('seq_len', 96)
         config['data']['pred_len'] = dataset_config.get('pred_len', 96)
