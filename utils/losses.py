@@ -25,14 +25,10 @@ class CompositeLoss(nn.Module):
         self.reconstruction_weight = loss_weights.get('reconstruction', 0.1)
         self.triplet_weight = loss_weights.get('triplet', 0.1)
         
-        # 文档设计：移除聚类损失！
-        # 移除: self.clustering_weight
-        # 移除: self.balance_weight
-        
         # 基础损失函数
         self.mse_loss = nn.MSELoss()
         
-        # 三元组损失 - 按文档设计
+        # 三元组损失 
         triplet_margin = config['training'].get('triplet_margin', 0.5)
         self.triplet_loss = TripletLoss(margin=triplet_margin)
         
@@ -60,9 +56,9 @@ class CompositeLoss(nn.Module):
         predictions = self._stabilize_tensor(predictions, "predictions")
         targets = self._stabilize_tensor(targets, "targets")
         
-        # 预测损失 - 🔧 关键修复：使用更保守的损失计算
+        # 预测损失 
         prediction_loss = F.mse_loss(predictions, targets, reduction='mean')
-        prediction_loss = torch.clamp(prediction_loss, min=0.0, max=10.0)  # 更严格的上限
+        prediction_loss = torch.clamp(prediction_loss, min=0.0, max=10.0) 
         
         # 损失数值稳定性检查
         if torch.isnan(prediction_loss) or torch.isinf(prediction_loss):
@@ -105,7 +101,7 @@ class CompositeLoss(nn.Module):
                     print("警告: 重构损失包含NaN或Inf，重置为零")
                     reconstruction_loss = torch.tensor(0.0, device=predictions.device, requires_grad=True)
         
-        # 三元组损失 - 🔧 关键修复：更保守的计算
+        # 三元组损失 
         triplet_loss = torch.tensor(0.0, device=predictions.device, requires_grad=True)
         if expert_weights is not None and expert_embeddings is not None:
             try:
@@ -132,7 +128,7 @@ class CompositeLoss(nn.Module):
                 print(f"警告: 三元组损失计算失败: {e}")
                 triplet_loss = torch.tensor(0.0, device=predictions.device, requires_grad=True)
         
-        # 总损失计算 - 🔧 关键修复：更保守的权重
+        # 总损失计算 
         total_loss = (
             self.prediction_weight * prediction_loss +
             self.reconstruction_weight * reconstruction_loss +

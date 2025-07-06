@@ -11,7 +11,17 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from typing import Dict, List, Optional, Tuple
 
-from m2moep.models.flow import PowerfulNormalizingFlow
+# 修复导入路径 - 使用相对导入兼容简化版结构
+try:
+    from ..models.flow import PowerfulNormalizingFlow
+except ImportError:
+    # 如果相对导入失败，尝试绝对导入（兼容原版结构）
+    try:
+        from m2moep.models.flow import PowerfulNormalizingFlow
+    except ImportError:
+        # 如果都失败，提供一个备用类
+        print("警告: 无法导入PowerfulNormalizingFlow，Flow功能将被禁用")
+        PowerfulNormalizingFlow = None
 
 
 class UniversalDataset(Dataset):
@@ -259,12 +269,16 @@ class UniversalDataModule:
     
     def _load_flow_model(self):
         """加载Flow模型"""
+        # 如果PowerfulNormalizingFlow不可用，跳过Flow模型加载
+        if PowerfulNormalizingFlow is None:
+            print("跳过Flow模型加载 - PowerfulNormalizingFlow不可用")
+            self.flow_model = None
+            return
+            
         flow_model_path = self.config['training'].get('flow_model_path', 'flow_model_default.pth')
         
         if os.path.exists(flow_model_path):
             try:
-                from m2moep.models.flow import PowerfulNormalizingFlow
-                
                 # 计算正确的输入维度
                 input_dim = self.data_info['num_features'] * self.seq_len
                 latent_dim = min(512, input_dim // 4)  # 自适应潜在维度
