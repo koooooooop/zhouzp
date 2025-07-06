@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 M²-MOEP训练脚本
 """
@@ -17,11 +18,11 @@ from typing import Dict, Optional, Tuple
 import argparse
 import json
 
-from models.m2_moep import M2_MOEP
-from data.universal_dataset import UniversalDataModule
-from utils.losses import CompositeLoss
-from utils.metrics import calculate_metrics
-from configs.config_generator import ConfigGenerator
+from m2moep.models.m2_moep import M2_MOEP
+from m2moep.data.universal_dataset import UniversalDataModule
+from m2moep.utils.losses import CompositeLoss
+from m2moep.utils.metrics import calculate_metrics
+from m2moep.configs.config_generator import ConfigGenerator
 
 
 class M2MOEPTrainer:
@@ -215,7 +216,7 @@ class M2MOEPTrainer:
         
         try:
             # 导入预训练函数
-            from pretrain_flow import pretrain_flow_model
+            from m2moep.pretrain_flow import pretrain_flow_model
             success = pretrain_flow_model(self.config, flow_model_path)
             
             if success:
@@ -434,7 +435,7 @@ class M2MOEPTrainer:
                     'Loss': f"{total_loss.item():.4f}",
                     'Pred': f"{losses.get('prediction', 0):.4f}",
                     'Triplet': f"{aux_info.get('triplet_loss', 0):.4f}",
-                    'Temp': f"{self.model.temperature:.3f}",
+                    'Temp': f"{self.model.temperature.item():.3f}",
                     'Grad': f"{total_grad_norm:.3f}",
                     'Clip': f"{clip_value:.3f}"
                 })
@@ -587,7 +588,7 @@ class M2MOEPTrainer:
                 f"RMSE: {val_metrics['RMSE']:.4f} | "
                 f"MAE: {val_metrics['MAE']:.4f} | "
                 f"R²: {val_metrics['R2']:.4f} | "
-                f"Temp: {self.model.temperature:.3f}"
+                f"Temp: {self.model.temperature.item():.3f}"
             )
             
             # 检查是否为最佳模型

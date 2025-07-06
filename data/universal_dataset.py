@@ -11,7 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from typing import Dict, List, Optional, Tuple
 
-from models.flow import PowerfulNormalizingFlow
+from m2moep.models.flow import PowerfulNormalizingFlow
 
 
 class UniversalDataset(Dataset):
@@ -263,7 +263,7 @@ class UniversalDataModule:
         
         if os.path.exists(flow_model_path):
             try:
-                from models.flow import PowerfulNormalizingFlow
+                from m2moep.models.flow import PowerfulNormalizingFlow
                 
                 # 计算正确的输入维度
                 input_dim = self.data_info['num_features'] * self.seq_len

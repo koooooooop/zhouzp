@@ -1,0 +1,131 @@
+# Weather 真实数据集配置
+# 基于实际的 weather.csv 文件
+
+data:
+  dataset_name: "weather"
+  data_path: "m2moep/dataset/weather/weather.csv"  # 🔧 修正路径（相对于项目根目录）
+  seq_len: 96
+  pred_len: 24
+  features: "M"  # multivariate
+  target: "OT"
+  # 训练数据配置
+  train_ratio: 0.7
+  val_ratio: 0.2
+  test_ratio: 0.1
+  # 数据加载配置
+  batch_size: 8             # 保守的批次大小
+  num_workers: 2
+  pin_memory: true
+  # 数据处理配置
+  scaler_type: "standard"
+  normalize: true
+  inverse: false
+  standardize: true
+  
+model:
+  model_name: "M2_MOEP"
+  
+  # 基础模型参数 - 保守设置（Weather数据通常21个特征）
+  input_dim: 21             # Weather数据集特征数
+  output_dim: 21
+  hidden_dim: 64
+  seq_len: 96
+  pred_len: 24
+  
+  # 专家系统参数
+  num_experts: 4
+  top_k: 2
+  embedding_dim: 128
+  
+  # 专家网络参数
+  expert_params:
+    mamba_d_model: 64
+    mamba_scales: [1, 2, 4]
+    
+  # 温度调度参数
+  temperature:
+    initial: 5.0
+    min: 1.0
+    max: 10.0
+    decay_rate: 0.95
+    
+  # Flow模型参数
+  flow:
+    num_layers: 4
+    hidden_dim: 128
+    latent_dim: 256
+    input_dim: 504        
+    use_pretrained: true
+    
+training:
+  # 基础训练参数
+  batch_size: 8
+  learning_rate: 0.0001
+  epochs: 50
+  
+  # 优化器参数
+  optimizer: "adamw"
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1e-8
+  
+  # 学习率调度
+  scheduler: "cosine"
+  lr_min: 1e-6
+  warmup_epochs: 5
+  
+  # 梯度控制
+  gradient_clip: 1.0        # 🔧 放宽梯度裁剪阈值
+  use_amp: false
+  
+  # 损失函数权重
+  loss_weights:
+    prediction: 1.0
+    reconstruction: 0.1
+    triplet: 0.05
+  
+  # 训练策略
+  use_reconstruction_loss: true
+  use_triplet_loss: true
+  
+  # 三元组损失参数
+  triplet_margin: 0.2
+  triplet_mining: "batch_hard"
+  
+  # 验证和保存设置
+  val_check_interval: 1
+  save_top_k: 3
+  
+  # 早停设置
+  early_stopping:
+    patience: 10
+    min_delta: 0.001
+    
+  # 数值稳定性设置
+  numerical_stability:
+    loss_clamp_max: 10.0
+    grad_norm_threshold: 1.0
+    nan_detection: true
+    
+# 输出设置
+output:
+  save_dir: "checkpoints"
+  log_dir: "logs"
+  result_dir: "results"
+  
+# 设备设置
+device: "cuda"
+seed: 42
+
+# 调试设置
+debug:
+  log_gradients: true
+  check_numerical: true
+  profile_memory: false
+  
+# 实验设置
+experiment:
+  name: "weather_real_data"
+  description: "Weather数据集真实数据训练"
+  tags: ["weather", "real_data", "multivariate"] 

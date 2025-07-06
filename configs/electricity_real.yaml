@@ -1,0 +1,131 @@
+# Electricity 真实数据集配置
+# 基于实际的 electricity.csv 文件 (321个客户用电量)
+
+data:
+  dataset_name: "electricity"
+  data_path: "m2moep/dataset/electricity_321个客户的每小时用电量/electricity.csv"
+  seq_len: 96
+  pred_len: 24
+  features: "M"  # multivariate
+  target: "MT_320"  # 通常最后一列是目标
+  # 训练数据配置
+  train_ratio: 0.7
+  val_ratio: 0.2
+  test_ratio: 0.1
+  # 数据加载配置
+  batch_size: 4             # 更小的批次（321个特征较多）
+  num_workers: 2
+  pin_memory: true
+  # 数据处理配置
+  scaler_type: "standard"
+  normalize: true
+  inverse: false
+  standardize: true
+  
+model:
+  model_name: "M2_MOEP"
+  
+  # 基础模型参数 - 针对高维数据（321个客户）
+  input_dim: 321            # Electricity数据集特征数
+  output_dim: 321
+  hidden_dim: 128           # 增加隐藏层维度
+  seq_len: 96
+  pred_len: 24
+  
+  # 专家系统参数
+  num_experts: 6            # 更多专家处理高维数据
+  top_k: 3
+  embedding_dim: 256        # 增加嵌入维度
+  
+  # 专家网络参数
+  expert_params:
+    mamba_d_model: 128      # 增加模型维度
+    mamba_scales: [1, 2, 4, 8]
+    
+  # 温度调度参数
+  temperature:
+    initial: 3.0
+    min: 0.5
+    max: 8.0
+    decay_rate: 0.98
+    
+  # Flow模型参数
+  flow:
+    num_layers: 6
+    hidden_dim: 256
+    latent_dim: 512
+    input_dim: 30816         # 321 * 96
+    use_pretrained: true
+    
+training:
+  # 基础训练参数
+  batch_size: 4
+  learning_rate: 0.00005    # 更小的学习率
+  epochs: 30                # 减少轮数（大数据集收敛快）
+  
+  # 优化器参数
+  optimizer: "adamw"
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1e-8
+  
+  # 学习率调度
+  scheduler: "cosine"
+  lr_min: 1e-7
+  warmup_epochs: 3
+  
+  # 梯度控制
+  gradient_clip: 0.3        # 严格的梯度裁剪（高维数据）
+  use_amp: false
+  
+  # 损失函数权重
+  loss_weights:
+    prediction: 1.0
+    reconstruction: 0.05    # 减少重构损失权重
+    triplet: 0.02
+  
+  # 训练策略
+  use_reconstruction_loss: true
+  use_triplet_loss: true
+  
+  # 三元组损失参数
+  triplet_margin: 0.1
+  triplet_mining: "batch_hard"
+  
+  # 验证和保存设置
+  val_check_interval: 1
+  save_top_k: 2
+  
+  # 早停设置
+  early_stopping:
+    patience: 8
+    min_delta: 0.0005
+    
+  # 数值稳定性设置
+  numerical_stability:
+    loss_clamp_max: 8.0
+    grad_norm_threshold: 0.8
+    nan_detection: true
+    
+# 输出设置
+output:
+  save_dir: "checkpoints"
+  log_dir: "logs"
+  result_dir: "results"
+  
+# 设备设置
+device: "cuda"
+seed: 42
+
+# 调试设置
+debug:
+  log_gradients: true
+  check_numerical: true
+  profile_memory: true      # 监控内存使用
+  
+# 实验设置
+experiment:
+  name: "electricity_real_data"
+  description: "Electricity数据集（321个客户）真实数据训练"
+  tags: ["electricity", "real_data", "high_dimensional"] 

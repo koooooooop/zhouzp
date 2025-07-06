@@ -3,7 +3,7 @@
 
 data:
   dataset_name: "weather"
-  data_path: "dataset/weather/weather.csv"
+  data_path: "synthetic"  # 🔧 使用合成数据
   seq_len: 96
   pred_len: 96
   features: "M"  # multivariate

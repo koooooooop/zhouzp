@@ -76,11 +76,27 @@ class CompositeLoss(nn.Module):
             if not flow_embeddings.requires_grad:
                 flow_embeddings = flow_embeddings.requires_grad_(True)
             
-            # 确保维度匹配
             if flow_embeddings.shape != targets.shape:
-                # 如果维度不匹配，跳过重构损失
-                print(f"警告: 重构损失维度不匹配 flow:{flow_embeddings.shape} vs targets:{targets.shape}")
-                reconstruction_loss = torch.tensor(0.0, device=predictions.device, requires_grad=True)
+                # 如果flow_embeddings的时间维度比targets大，提取最后的pred_len步
+                if (flow_embeddings.dim() == 3 and targets.dim() == 3 and 
+                    flow_embeddings.shape[0] == targets.shape[0] and 
+                    flow_embeddings.shape[2] == targets.shape[2] and 
+                    flow_embeddings.shape[1] > targets.shape[1]):
+                    
+                    # 提取最后的pred_len个时间步
+                    pred_len = targets.shape[1]
+                    flow_embeddings_matched = flow_embeddings[:, -pred_len:, :]
+                    
+                    reconstruction_loss = F.mse_loss(flow_embeddings_matched, targets, reduction='mean')
+                    reconstruction_loss = torch.clamp(reconstruction_loss, min=0.0, max=10.0)
+                    
+                    if torch.isnan(reconstruction_loss) or torch.isinf(reconstruction_loss):
+                        print("警告: 重构损失包含NaN或Inf，重置为零")
+                        reconstruction_loss = torch.tensor(0.0, device=predictions.device, requires_grad=True)
+                else:
+                    # 其他维度不匹配情况，跳过重构损失
+                    print(f"警告: 重构损失维度不匹配 flow:{flow_embeddings.shape} vs targets:{targets.shape}")
+                    reconstruction_loss = torch.tensor(0.0, device=predictions.device, requires_grad=True)
             else:
                 reconstruction_loss = F.mse_loss(flow_embeddings, targets, reduction='mean')
                 reconstruction_loss = torch.clamp(reconstruction_loss, min=0.0, max=10.0)

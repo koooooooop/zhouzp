@@ -1,0 +1,127 @@
+# Weather 稳定训练配置 v2
+# 针对梯度爆炸问题的优化版本
+
+data:
+  dataset_name: "weather"
+  data_path: "m2moep/dataset/weather/weather.csv"
+  seq_len: 96
+  pred_len: 24
+  features: "M"
+  target: "OT"
+  train_ratio: 0.7
+  val_ratio: 0.2
+  test_ratio: 0.1
+  batch_size: 8
+  num_workers: 2
+  pin_memory: true
+  scaler_type: "standard"
+  normalize: true
+  inverse: false
+  standardize: true
+  
+model:
+  model_name: "M2_MOEP"
+  
+  # 基础参数 - 更保守的设置
+  input_dim: 21
+  output_dim: 21
+  hidden_dim: 32              # 🔧 进一步减小隐藏层维度
+  seq_len: 96
+  pred_len: 24
+  
+  # 专家系统参数 - 减少复杂度
+  num_experts: 2              # 🔧 减少专家数量
+  top_k: 1                    # 🔧 只选择最优专家
+  embedding_dim: 64           # 🔧 减小嵌入维度
+  
+  # 专家网络参数 - 更稳定的初始化
+  expert_params:
+    mamba_d_model: 32
+    mamba_scales: [1, 2]      # 🔧 减少尺度数
+    initial_delta: 1.0        # 🔧 设置更小的初始delta
+    
+  # 温度调度参数 - 更保守
+  temperature:
+    initial: 2.0              # 🔧 降低初始温度
+    min: 0.5
+    max: 5.0
+    decay_rate: 0.98
+    
+  # Flow模型参数 - 简化
+  flow:
+    num_layers: 2             # 🔧 减少层数
+    hidden_dim: 64            # 🔧 减小隐藏层
+    latent_dim: 128           # 🔧 减小潜在维度
+    input_dim: 504            # 21 * 24
+    use_pretrained: false     # 🔧 暂时关闭预训练
+    
+training:
+  # 基础训练参数 - 更保守
+  batch_size: 8
+  learning_rate: 0.00001      # 🔧 大幅降低学习率
+  epochs: 50
+  
+  # 优化器参数 - 更稳定
+  optimizer: "adamw"
+  weight_decay: 0.001         # 🔧 减小权重衰减
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1e-8
+  
+  # 学习率调度 - 更平缓
+  scheduler: "reduce_on_plateau"  # 🔧 改用自适应调度
+  factor: 0.5
+  patience: 5
+  min_lr: 1e-7
+  
+  # 梯度控制 - 更严格
+  gradient_clip: 0.1          # 🔧 严格梯度裁剪
+  use_amp: false
+  
+  # 损失函数权重 - 更平衡
+  loss_weights:
+    prediction: 1.0
+    reconstruction: 0.01      # 🔧 降低重构损失权重
+    triplet: 0.001            # 🔧 降低三元组损失权重
+  
+  # 训练策略 - 逐步启用
+  use_reconstruction_loss: false  # 🔧 先关闭重构损失
+  use_triplet_loss: false         # 🔧 先关闭三元组损失
+  
+  # 数值稳定性 - 更严格
+  numerical_stability:
+    loss_clamp_max: 5.0       # 🔧 更严格的损失裁剪
+    grad_norm_threshold: 0.1  # 🔧 更小的梯度阈值
+    nan_detection: true
+    weight_init_scale: 0.1    # 🔧 权重初始化缩放
+    
+  # 验证设置
+  val_check_interval: 1
+  save_top_k: 3
+  
+  # 早停设置 - 更敏感
+  early_stopping:
+    patience: 5               # 🔧 更小的耐心值
+    min_delta: 0.0001         # 🔧 更小的改善阈值
+    
+# 输出设置
+output:
+  save_dir: "checkpoints"
+  log_dir: "logs"
+  result_dir: "results"
+  
+# 设备设置
+device: "cuda"
+seed: 42
+
+# 调试设置
+debug:
+  log_gradients: true
+  check_numerical: true
+  profile_memory: false
+  
+# 实验设置
+experiment:
+  name: "weather_stable_v2"
+  description: "梯度爆炸修正版配置"
+  tags: ["weather", "stable", "gradient_fix"] 

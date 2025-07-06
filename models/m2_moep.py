@@ -142,7 +142,9 @@ class M2_MOEP(nn.Module):
     def _init_temperature_scheduler(self):
         """初始化温度调度器"""
         temp_config = self.model_config.get('temperature', {})
-        self.temperature = temp_config.get('initial', 1.0)
+        initial_temp = temp_config.get('initial', 1.0)
+        self.temperature.data = torch.tensor(initial_temp, dtype=torch.float32)
+        
         self.temp_min = temp_config.get('min', 0.1)
         self.temp_max = temp_config.get('max', 5.0)
         self.temp_decay = temp_config.get('decay', 0.95)
@@ -150,7 +152,7 @@ class M2_MOEP(nn.Module):
         
         # 温度调度统计
         self.temp_stats = {
-            'current': self.temperature,
+            'current': self.temperature.item(),
             'adjustments': 0,
             'performance_history': []
         }
@@ -558,13 +560,13 @@ class M2_MOEP(nn.Module):
                 prev_perf = self.temp_stats['performance_history'][-2]
                 
                 if current_perf > prev_perf:  # 性能提升
-                    self.temperature = max(self.temp_min, self.temperature * self.temp_decay)
+                    self.temperature.data = max(self.temp_min, self.temperature.data * self.temp_decay)
                 else:  # 性能下降
-                    self.temperature = min(self.temp_max, self.temperature / self.temp_decay)
+                    self.temperature.data = min(self.temp_max, self.temperature.data / self.temp_decay)
                 
                 self.temp_stats['adjustments'] += 1
         
-        self.temp_stats['current'] = self.temperature
+        self.temp_stats['current'] = self.temperature.item()
     
     def to(self, device):
         """重写to方法，确保所有组件都移动到正确设备"""

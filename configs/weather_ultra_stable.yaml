@@ -1,5 +1,6 @@
 # M²-MOEP标准配置 - weather数据集 🔧 按照文档要求重新设计
 # 实现完整的Flow模型映射 + 度量学习门控 + 专家原型机制
+# 🆕 集成FrequencyMamba风格的频域处理
 
 data:
   dataset_name: "weather"
@@ -37,10 +38,17 @@ model:
   top_k: 2                  # 🔧 激活2个专家
   embedding_dim: 128        # 🔧 嵌入维度
   
-  # 专家网络参数 - 多尺度设计
+  # 专家网络参数 - 多尺度设计 + FrequencyMamba风格
   expert_params:
     mamba_d_model: 64       # 🔧 Mamba模型维度
     mamba_scales: [1, 2, 4] # 🔧 多尺度设计
+    # 🆕 FrequencyMamba风格的FFT参数
+    fft_bins: 16            # 🆕 FFT频率分量数量
+    freq_attention_dropout: 0.1  # 🆕 频域注意力dropout
+    time_freq_fusion_dropout: 0.1  # 🆕 时频融合dropout
+    freq_gate_activation: "sigmoid"  # 🆕 频域门控激活函数
+    magnitude_scale_init: 1.0  # 🆕 幅度缩放初始值
+    phase_scale_init: 0.1   # 🆕 相位缩放初始值
     
   # Flow模型参数 - 🔧 恢复Flow模型的正确使用
   flow:
@@ -83,10 +91,16 @@ training:
     triplet: 0.1            # 🔧 三元组路由损失
     prototype_reg: 0.01     # 🔧 专家原型正则化
     load_balance: 0.01      # 🔧 负载均衡损失
+    # 🆕 FrequencyMamba相关损失权重
+    freq_regularization: 0.001  # 🆕 频域正则化损失
+    time_freq_consistency: 0.005  # 🆕 时频一致性损失
   
   # 训练策略 - 恢复完整功能
   use_reconstruction_loss: true   # 🔧 启用重构损失
   use_triplet_loss: true          # 🔧 启用三元组损失
+  # 🆕 FrequencyMamba相关训练策略
+  use_freq_regularization: true   # 🆕 启用频域正则化
+  use_time_freq_consistency: true # 🆕 启用时频一致性约束
   
   # 验证和保存设置
   val_check_interval: 1
@@ -102,6 +116,10 @@ training:
     loss_clamp_max: 10.0    # 🔧 合理的损失上限
     grad_norm_threshold: 1.0 # 🔧 合理的梯度范数阈值
     nan_detection: true
+    # 🆕 FFT数值稳定性设置
+    fft_magnitude_clamp_max: 100.0  # 🆕 FFT幅度上限
+    fft_phase_clamp_range: 3.14159  # 🆕 FFT相位范围
+    freq_feature_clamp_max: 10.0    # 🆕 频域特征上限
     
 # 输出设置
 output:
@@ -118,9 +136,12 @@ debug:
   log_gradients: true
   check_numerical: true
   profile_memory: false
+  # 🆕 FrequencyMamba调试设置
+  log_fft_features: false     # 🆕 记录FFT特征
+  visualize_freq_attention: false  # 🆕 可视化频域注意力
   
 # 实验设置
 experiment:
-  name: "weather_m2_moep_standard"
-  description: "Weather数据集M²-MOEP标准实验 - 完整Flow模型+度量学习门控+专家原型"
-  tags: ["weather", "m2_moep", "flow_model", "metric_learning", "expert_prototypes"] 
+  name: "weather_m2_moep_frequency_mamba"
+  description: "Weather数据集M²-MOEP实验 - 集成FrequencyMamba风格的频域处理"
+  tags: ["weather", "m2_moep", "frequency_mamba", "fft_fusion", "time_freq_domain"] 
