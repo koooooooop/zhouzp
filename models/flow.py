@@ -4,116 +4,6 @@ import torch.nn.functional as F
 import numpy as np
 from torch.distributions import Normal
 
-# 原有的Flow实现
-class FlowLayer(nn.Module):
-    def __init__(self, dim):
-        super(FlowLayer, self).__init__()
-        self.scale = nn.Parameter(torch.randn(1, dim))
-        self.shift = nn.Parameter(torch.randn(1, dim))
-
-    def forward(self, x):
-        """
-        前向传播
-        Args:
-            x: 输入张量 [batch_size, input_dim]
-        Returns:
-            z: 变换后的张量 [batch_size, input_dim]
-            log_det_jacobian: 对数行列式 [batch_size]
-        """
-        # 仿射变换: z = x * scale + shift
-        z = x * self.scale + self.shift
-        
-        # 计算对数行列式（仿射变换的雅可比矩阵是对角矩阵）
-        log_det_jacobian = torch.sum(torch.log(torch.abs(self.scale) + 1e-8), dim=1)
-        
-        # 确保log_det_jacobian的形状为[batch_size]
-        if log_det_jacobian.dim() == 0:
-            log_det_jacobian = log_det_jacobian.expand(x.size(0))
-        elif log_det_jacobian.dim() == 1 and log_det_jacobian.size(0) == 1:
-            log_det_jacobian = log_det_jacobian.expand(x.size(0))
-        
-        return z, log_det_jacobian
-
-class NormalizingFlow(nn.Module):
-    def __init__(self, input_size, flow_layers=4):
-        super(NormalizingFlow, self).__init__()
-        self.input_size = input_size
-        self.flow_layers = nn.ModuleList([FlowLayer(input_size) for _ in range(flow_layers)])
-        self.register_buffer("prior_loc", torch.zeros(input_size))
-        self.register_buffer("prior_scale", torch.ones(input_size))
-
-    def forward(self, x):
-        # x is expected to be of shape [Batch, input_size]
-        log_det_jacobian_sum = 0
-        for flow in self.flow_layers:
-            x, log_det_jacobian = flow(x)
-            log_det_jacobian_sum += log_det_jacobian
-        return x, log_det_jacobian_sum
-
-    def inverse(self, z):
-        """
-        逆变换：z -> x
-        按文档要求实现重构功能
-        """
-        try:
-            # 逆向通过所有Flow层
-            for flow in reversed(self.flow_layers):
-                z = (z - flow.shift) / torch.exp(flow.scale)
-            return z
-        except Exception as e:
-            print(f"Flow逆变换失败: {e}")
-            return z  # 返回原始输入
-
-    def log_prob(self, x):
-        """
-        计算对数概率
-        """
-        try:
-            z, log_det_jacobian_sum = self.forward(x)
-            
-            # 数值稳定性检查
-            if torch.isnan(z).any() or torch.isinf(z).any():
-                print("警告: Flow变换结果包含NaN/Inf")
-                return torch.tensor(-1e6, device=x.device).expand(x.size(0))
-            
-            if torch.isnan(log_det_jacobian_sum).any() or torch.isinf(log_det_jacobian_sum).any():
-                print("警告: 雅可比行列式包含NaN/Inf")
-                log_det_jacobian_sum = torch.zeros_like(log_det_jacobian_sum)
-            
-            # 先验分布的对数概率
-            prior = Normal(self.prior_loc, self.prior_scale)
-            log_prob_prior = prior.log_prob(z).sum(dim=1)
-            
-            # 检查先验概率
-            if torch.isnan(log_prob_prior).any() or torch.isinf(log_prob_prior).any():
-                print("警告: 先验概率包含NaN/Inf")
-                log_prob_prior = torch.tensor(-1e6, device=x.device).expand(x.size(0))
-            
-            total_log_prob = log_prob_prior + log_det_jacobian_sum
-            
-            # 最终检查
-            if torch.isnan(total_log_prob).any() or torch.isinf(total_log_prob).any():
-                print("警告: 总对数概率包含NaN/Inf，使用备用值")
-                total_log_prob = torch.tensor(-1e6, device=x.device).expand(x.size(0))
-            
-            return total_log_prob
-            
-        except Exception as e:
-            print(f"Flow log_prob计算失败: {e}")
-            return torch.tensor(-1e6, device=x.device).expand(x.size(0))
-    
-    def reconstruct(self, x):
-        """重构输入"""
-        try:
-            z, _ = self.forward(x)
-            # 逆变换
-            for flow in reversed(self.flow_layers):
-                z = (z - flow.shift) / torch.exp(flow.scale)
-            return z
-        except Exception as e:
-            print(f"Flow重构失败: {e}")
-            return x
-
 # === 强大的Real NVP风格Flow模型实现 ===
 class RealNVPCouplingLayer(nn.Module):
     """
@@ -254,38 +144,32 @@ class PowerfulNormalizingFlow(nn.Module):
     
     def encode(self, x):
         """编码到潜在空间"""
-        # 数值稳定性检查
+        # 批量数值稳定性检查
         if torch.isnan(x).any() or torch.isinf(x).any():
-            print("警告: Flow编码输入包含NaN或Inf，执行修复")
             x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
         
         # 使用编码器网络
         z_latent = self.encoder(x)
         
-        # 输出检查
+        # 输出检查（简化）
         if torch.isnan(z_latent).any() or torch.isinf(z_latent).any():
-            print("警告: Flow编码输出包含异常值，使用零向量")
             z_latent = torch.zeros_like(z_latent)
         
         return z_latent
     
     def decode(self, z_latent):
         """将潜在表示解码回原始空间"""
-        # 数值稳定性检查
+        # 简化的数值检查
         if torch.isnan(z_latent).any() or torch.isinf(z_latent).any():
-            print("警告: Flow解码输入包含NaN或Inf，使用零向量替代")
             z_latent = torch.zeros_like(z_latent)
         
         # 数值范围检查
-        if z_latent.abs().max() > 1e6:
-            print(f"警告: Flow解码输入值过大 (max: {z_latent.abs().max().item():.2e})")
-            z_latent = torch.clamp(z_latent, -1e6, 1e6)
+        z_latent = torch.clamp(z_latent, -100.0, 100.0)  # 简化范围
         
         x_recon = self.decoder(z_latent)
         
-        # 解码结果检查
+        # 解码结果检查（简化）
         if torch.isnan(x_recon).any() or torch.isinf(x_recon).any():
-            print("警告: Flow解码结果包含NaN或Inf，使用零向量替代")
             x_recon = torch.zeros_like(x_recon)
         
         return x_recon

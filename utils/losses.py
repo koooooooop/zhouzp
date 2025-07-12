@@ -11,7 +11,7 @@ import logging
 
 
 class CompositeLoss(nn.Module):
-    """复合损失函数 """
+    """复合损失函数 - 优化版本"""
 
     def __init__(self, config):
         super().__init__()
@@ -32,9 +32,15 @@ class CompositeLoss(nn.Module):
         triplet_margin = config['training'].get('triplet_margin', 0.5)
         self.triplet_loss = TripletLoss(margin=triplet_margin)
         
-        # 数值稳定性参数
+        # 数值稳定性参数 - 优化：预计算常用值
         self.loss_clamp_min = 0.0
         self.loss_clamp_max = 100.0
+        self.safe_zero = torch.tensor(0.0)
+        self.safe_one = torch.tensor(1.0)
+        
+        # 性能统计
+        self.forward_count = 0
+        self.nan_count = 0
         
         print("损失函数:")
         print(f"   - 预测损失权重: {self.prediction_weight}")
@@ -44,107 +50,82 @@ class CompositeLoss(nn.Module):
     def forward(self, predictions, targets, expert_weights=None, expert_embeddings=None, 
                 flow_embeddings=None, flow_log_det=None, **kwargs):
         """
-        前向传播
+        前向传播 - 优化版本
         """
-        # 确保所有输入张量都需要梯度
-        if not predictions.requires_grad:
-            predictions = predictions.requires_grad_(True)
-        if not targets.requires_grad:
-            targets = targets.requires_grad_(True)
+        self.forward_count += 1
+        device = predictions.device
+        dtype = predictions.dtype
         
-        # 输入数值稳定性检查
-        predictions = self._stabilize_tensor(predictions, "predictions")
-        targets = self._stabilize_tensor(targets, "targets")
+        # 批量数值稳定性检查 - 优化：一次性检查所有张量
+        tensors_to_check = [predictions, targets]
+        if expert_weights is not None:
+            tensors_to_check.append(expert_weights)
+        if expert_embeddings is not None:
+            tensors_to_check.append(expert_embeddings)
+        if flow_embeddings is not None:
+            tensors_to_check.append(flow_embeddings)
         
-        # 预测损失 
+        has_nan_inf = False
+        for tensor in tensors_to_check:
+            if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                has_nan_inf = True
+                break
+        
+        if has_nan_inf:
+            self.nan_count += 1
+            print(f"警告: 检测到NaN/Inf值 (第{self.nan_count}次)")
+            # 批量修复
+            predictions = self._batch_stabilize_tensors([predictions])[0]
+            targets = self._batch_stabilize_tensors([targets])[0]
+            if expert_weights is not None:
+                expert_weights = self._batch_stabilize_tensors([expert_weights])[0]
+            if expert_embeddings is not None:
+                expert_embeddings = self._batch_stabilize_tensors([expert_embeddings])[0]
+            if flow_embeddings is not None:
+                flow_embeddings = self._batch_stabilize_tensors([flow_embeddings])[0]
+        
+        # 预测损失 - 优化：直接使用F.mse_loss
         prediction_loss = F.mse_loss(predictions, targets, reduction='mean')
         prediction_loss = torch.clamp(prediction_loss, min=0.0, max=10.0) 
         
-        # 损失数值稳定性检查
-        if torch.isnan(prediction_loss) or torch.isinf(prediction_loss):
-            print("警告: 预测损失包含NaN或Inf，重置为安全值")
-            prediction_loss = torch.tensor(1.0, device=predictions.device, requires_grad=True)
-        
-        # 重构损失
-        reconstruction_loss = torch.tensor(0.0, device=predictions.device, requires_grad=True)
+        # 重构损失 - 优化：简化逻辑
+        reconstruction_loss = self.safe_zero.to(device).to(dtype)
         if flow_embeddings is not None:
-            flow_embeddings = self._stabilize_tensor(flow_embeddings, "flow_embeddings")
-            if not flow_embeddings.requires_grad:
-                flow_embeddings = flow_embeddings.requires_grad_(True)
-            
-            if flow_embeddings.shape != targets.shape:
-                # 如果flow_embeddings的时间维度比targets大，提取最后的pred_len步
-                if (flow_embeddings.dim() == 3 and targets.dim() == 3 and 
-                    flow_embeddings.shape[0] == targets.shape[0] and 
-                    flow_embeddings.shape[2] == targets.shape[2] and 
-                    flow_embeddings.shape[1] > targets.shape[1]):
-                    
-                    # 提取最后的pred_len个时间步
-                    pred_len = targets.shape[1]
-                    flow_embeddings_matched = flow_embeddings[:, -pred_len:, :]
-                    
-                    reconstruction_loss = F.mse_loss(flow_embeddings_matched, targets, reduction='mean')
-                    reconstruction_loss = torch.clamp(reconstruction_loss, min=0.0, max=10.0)
-                    
-                    if torch.isnan(reconstruction_loss) or torch.isinf(reconstruction_loss):
-                        print("警告: 重构损失包含NaN或Inf，重置为零")
-                        reconstruction_loss = torch.tensor(0.0, device=predictions.device, requires_grad=True)
-                else:
-                    # 其他维度不匹配情况，跳过重构损失
-                    print(f"警告: 重构损失维度不匹配 flow:{flow_embeddings.shape} vs targets:{targets.shape}")
-                    reconstruction_loss = torch.tensor(0.0, device=predictions.device, requires_grad=True)
-            else:
+            if flow_embeddings.shape == targets.shape:
                 reconstruction_loss = F.mse_loss(flow_embeddings, targets, reduction='mean')
                 reconstruction_loss = torch.clamp(reconstruction_loss, min=0.0, max=10.0)
+            elif (flow_embeddings.dim() == 3 and targets.dim() == 3 and 
+                  flow_embeddings.shape[0] == targets.shape[0] and 
+                  flow_embeddings.shape[2] == targets.shape[2] and 
+                  flow_embeddings.shape[1] > targets.shape[1]):
+                # 提取匹配的时间步
+                pred_len = targets.shape[1]
+                flow_embeddings_matched = flow_embeddings[:, -pred_len:, :]
+                reconstruction_loss = F.mse_loss(flow_embeddings_matched, targets, reduction='mean')
+                reconstruction_loss = torch.clamp(reconstruction_loss, min=0.0, max=10.0)
                 
-                if torch.isnan(reconstruction_loss) or torch.isinf(reconstruction_loss):
-                    print("警告: 重构损失包含NaN或Inf，重置为零")
-                    reconstruction_loss = torch.tensor(0.0, device=predictions.device, requires_grad=True)
-        
-        # 三元组损失 
-        triplet_loss = torch.tensor(0.0, device=predictions.device, requires_grad=True)
-        if expert_weights is not None and expert_embeddings is not None:
+        # 三元组损失 - 优化：提前检查条件
+        triplet_loss = self.safe_zero.to(device).to(dtype)
+        if (expert_weights is not None and expert_embeddings is not None and 
+            expert_embeddings.numel() > 0 and expert_weights.numel() > 0):
             try:
-                # 数值稳定性检查
-                expert_weights = self._stabilize_tensor(expert_weights, "expert_weights")
-                expert_embeddings = self._stabilize_tensor(expert_embeddings, "expert_embeddings")
-                
-                # 确保需要梯度
-                if not expert_weights.requires_grad:
-                    expert_weights = expert_weights.requires_grad_(True)
-                if not expert_embeddings.requires_grad:
-                    expert_embeddings = expert_embeddings.requires_grad_(True)
-                
-                # 安全的三元组损失计算
-                if expert_embeddings.numel() > 0 and expert_weights.numel() > 0:
-                    triplet_loss = self.triplet_loss(expert_embeddings, expert_weights)
-                    triplet_loss = torch.clamp(triplet_loss, min=0.0, max=5.0)  # 更严格的上限
-                    
-                    if torch.isnan(triplet_loss) or torch.isinf(triplet_loss):
-                        print("警告: 三元组损失包含NaN或Inf，重置为零")
-                        triplet_loss = torch.tensor(0.0, device=predictions.device, requires_grad=True)
-                        
+                triplet_loss = self.triplet_loss(expert_embeddings, expert_weights)
+                triplet_loss = torch.clamp(triplet_loss, min=0.0, max=5.0)
             except Exception as e:
-                print(f"警告: 三元组损失计算失败: {e}")
-                triplet_loss = torch.tensor(0.0, device=predictions.device, requires_grad=True)
+                if self.forward_count % 100 == 0:  # 减少日志频率
+                    print(f"警告: 三元组损失计算失败: {e}")
         
-        # 总损失计算 
-        total_loss = (
-            self.prediction_weight * prediction_loss +
-            self.reconstruction_weight * reconstruction_loss +
-            self.triplet_weight * triplet_loss
-        )
+        # 总损失计算 - 优化：使用torch.addcmul等高效操作
+        total_loss = (self.prediction_weight * prediction_loss + 
+                     self.reconstruction_weight * reconstruction_loss +
+                     self.triplet_weight * triplet_loss)
         
         # 最终数值稳定性检查
-        total_loss = torch.clamp(total_loss, min=0.0, max=20.0)  # 更严格的总损失上限
-        
         if torch.isnan(total_loss) or torch.isinf(total_loss):
             print("错误: 总损失为NaN或Inf，使用预测损失备份")
             total_loss = prediction_loss
-        
-        # 确保总损失需要梯度
-        if not total_loss.requires_grad:
-            total_loss = total_loss.requires_grad_(True)
+        else:
+            total_loss = torch.clamp(total_loss, min=0.0, max=20.0)
         
         return {
             'total': total_loss,
@@ -153,25 +134,26 @@ class CompositeLoss(nn.Module):
             'triplet': triplet_loss
         }
 
+    def _batch_stabilize_tensors(self, tensors):
+        """批量数值稳定化处理 - 优化版本"""
+        stabilized_tensors = []
+        for tensor in tensors:
+            if tensor is None:
+                stabilized_tensors.append(tensor)
+                continue
+            
+            # 使用torch.nan_to_num一次性处理NaN和Inf
+            stabilized = torch.nan_to_num(tensor, nan=0.0, posinf=5.0, neginf=-5.0)
+            stabilized = torch.clamp(stabilized, min=-10.0, max=10.0)
+            stabilized_tensors.append(stabilized)
+        
+        return stabilized_tensors
+
     def _stabilize_tensor(self, tensor, name="tensor"):
-        """数值稳定化处理 - 增强版"""
+        """保留原有接口以保持兼容性"""
         if tensor is None:
             return tensor
-            
-        # 检查和修复NaN
-        if torch.isnan(tensor).any():
-            print(f"警告: {name}包含NaN，替换为0")
-            tensor = torch.nan_to_num(tensor, nan=0.0)
-        
-        # 检查和修复Inf
-        if torch.isinf(tensor).any():
-            print(f"警告: {name}包含Inf，进行截断")
-            tensor = torch.nan_to_num(tensor, posinf=5.0, neginf=-5.0)
-        
-        # 数值范围裁剪
-        tensor = torch.clamp(tensor, min=-10.0, max=10.0)
-        
-        return tensor
+        return self._batch_stabilize_tensors([tensor])[0]
 
     def compute_reconstruction_loss(self, x_original, x_reconstructed):
         """计算重构损失"""

@@ -11,8 +11,8 @@ import numpy as np
 from tqdm import tqdm
 import logging
 
-from m2moep.models.flow import PowerfulNormalizingFlow
-from m2moep.data.universal_dataset import UniversalDataModule
+from models.flow import PowerfulNormalizingFlow
+from data.universal_dataset import UniversalDataModule
 
 
 def pretrain_flow_model(config, save_path="flow_model_default.pth"):

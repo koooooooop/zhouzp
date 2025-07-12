@@ -8,7 +8,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, List
 
 from configs.config_generator import ConfigGenerator
-from universal_experiment import UniversalExperiment
+# from universal_experiment import UniversalExperiment  # 注释掉不存在的模块
 
 class ExperimentRunner:
     """实验批量运行器"""
@@ -18,7 +18,12 @@ class ExperimentRunner:
         self.max_workers = max_workers
         self.setup_logging()
         
-        self.experiment = UniversalExperiment(base_data_path=data_path)
+        # 定义支持的数据集
+        self.supported_datasets = [
+            'electricity', 'weather', 'traffic', 'ETTh1', 'ETTh2', 
+            'ETTm1', 'ETTm2', 'exchange_rate', 'illness', 'Solar', 'PEMS'
+        ]
+        print(f"支持的数据集: {', '.join(self.supported_datasets)}")
 
     def setup_logging(self):
         """设置日志"""
@@ -36,13 +41,46 @@ class ExperimentRunner:
         self.logger = logging.getLogger(__name__)
 
     def run_dataset_experiment(self, dataset_name: str, **kwargs) -> Dict:
-        """运行单个数据集实验（用于并行执行）"""
+        """运行单个数据集实验"""
         try:
-            result = self.experiment.run_single_experiment(dataset_name, **kwargs)
+            # 简化的实验运行：使用train.py
+            import subprocess
+            import sys
+            
+            # 构建基本命令
+            cmd = [
+                sys.executable, 'train.py',
+                '--config', f'configs/{dataset_name}_stable.yaml'
+            ]
+            
+            # 添加额外参数
+            for key, value in kwargs.items():
+                if key in ['epochs', 'batch_size', 'learning_rate']:
+                    cmd.extend([f'--{key}', str(value)])
+            
+            self.logger.info(f"运行命令: {' '.join(cmd)}")
+            
+            # 运行实验
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)  # 1小时超时
+            
+            if result.returncode == 0:
+                return {
+                    'dataset': dataset_name,
+                    'status': 'success',
+                    'output': result.stdout[-1000:] if result.stdout else ""  # 只保留最后1000字符
+                }
+            else:
+                return {
+                    'dataset': dataset_name,
+                    'status': 'failed',
+                    'error': result.stderr[-1000:] if result.stderr else "Unknown error"
+                }
+                
+        except subprocess.TimeoutExpired:
             return {
                 'dataset': dataset_name,
-                'status': 'success',
-                'result': result
+                'status': 'failed',
+                'error': 'Experiment timeout (1 hour)'
             }
         except Exception as e:
             return {
@@ -64,6 +102,8 @@ class ExperimentRunner:
             
             if result['status'] == 'success':
                 self.logger.info(f"✅ {dataset_name} 实验成功完成")
+            elif result['status'] == 'skipped':
+                self.logger.warning(f"⚠️ {dataset_name} 实验跳过: {result['error']}")
             else:
                 self.logger.error(f"❌ {dataset_name} 实验失败: {result['error']}")
         
@@ -91,6 +131,8 @@ class ExperimentRunner:
                     
                     if result['status'] == 'success':
                         self.logger.info(f"✅ {dataset} 实验成功完成")
+                    elif result['status'] == 'skipped':
+                        self.logger.warning(f"⚠️ {dataset} 实验跳过: {result['error']}")
                     else:
                         self.logger.error(f"❌ {dataset} 实验失败: {result['error']}")
                         
@@ -106,15 +148,10 @@ class ExperimentRunner:
 
     def run_all_experiments(self, parallel: bool = False, **kwargs) -> Dict:
         """运行所有可用数据集的实验"""
-        # 获取可用数据集
-        available_datasets = self.experiment.list_available_datasets()
-        dataset_names = [ds['name'] for ds in available_datasets]
+        # 使用预定义的支持数据集
+        dataset_names = self.supported_datasets
         
-        if not dataset_names:
-            self.logger.warning("没有找到可用的数据集")
-            return {}
-        
-        self.logger.info(f"找到 {len(dataset_names)} 个可用数据集: {', '.join(dataset_names)}")
+        self.logger.info(f"找到 {len(dataset_names)} 个支持的数据集: {', '.join(dataset_names)}")
         
         # 选择运行方式
         if parallel and self.max_workers > 1:
@@ -140,16 +177,13 @@ class ExperimentRunner:
         """运行指定数据集的实验"""
         self.logger.info(f"运行指定数据集的实验: {', '.join(datasets)}")
         
-        # 验证数据集是否可用
-        available_datasets = self.experiment.list_available_datasets()
-        available_names = [ds['name'] for ds in available_datasets]
-        
+        # 验证数据集是否支持
         valid_datasets = []
         for dataset in datasets:
-            if dataset in available_names:
+            if dataset in self.supported_datasets:
                 valid_datasets.append(dataset)
             else:
-                self.logger.warning(f"数据集 {dataset} 不可用，跳过")
+                self.logger.warning(f"数据集 {dataset} 不在支持列表中，跳过")
         
         if not valid_datasets:
             self.logger.error("没有有效的数据集可以运行")
@@ -193,12 +227,12 @@ class ExperimentRunner:
                 f.write("-" * 40 + "\n")
                 for dataset, result in results.items():
                     if result['status'] == 'success':
-                        metrics = result['result'].get('metrics', {})
-                        f.write(f"{dataset}:\n")
-                        f.write(f"  RMSE: {metrics.get('RMSE', 'N/A'):.4f}\n")
-                        f.write(f"  MAE: {metrics.get('MAE', 'N/A'):.4f}\n")
-                        f.write(f"  R²: {metrics.get('R2', 'N/A'):.4f}\n")
-                        f.write(f"  专家熵: {metrics.get('expert_entropy', 'N/A'):.4f}\n\n")
+                        f.write(f"{dataset}: 实验成功完成\n")
+                        if 'output' in result and result['output']:
+                            # 提取输出的最后几行作为摘要
+                            output_lines = result['output'].strip().split('\n')[-3:]
+                            f.write(f"  输出摘要: {' | '.join(output_lines)}\n")
+                        f.write("\n")
             
             # 失败实验详情
             if failed_count > 0:
@@ -206,7 +240,7 @@ class ExperimentRunner:
                 f.write("-" * 40 + "\n")
                 for dataset, result in results.items():
                     if result['status'] == 'failed':
-                        f.write(f"{dataset}: {result['error']}\n")
+                        f.write(f"{dataset}: {result.get('error', 'Unknown error')}\n")
         
         self.logger.info(f"实验汇总报告已保存到: {save_path}")
 
@@ -250,10 +284,9 @@ def main():
     else:
         # 显示帮助
         parser.print_help()
-        print("\n可用数据集:")
-        available = runner.experiment.list_available_datasets()
-        for ds in available:
-            print(f"  - {ds['name']}: {ds['description']}")
+        print("\n支持的数据集:")
+        for ds in runner.supported_datasets:
+            print(f"  - {ds}")
 
 if __name__ == '__main__':
     main()

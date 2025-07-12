@@ -37,60 +37,83 @@ class FrequencyMambaFFTExtractor(nn.Module):
         """
         try:
             batch_size = x.size(0)
-            fft_features = []
             
-            # 对每个变量分别进行FFT
-            for i in range(self.input_dim):
-                # 提取单个变量的时间序列
-                feature = x[:, :, i]  # [batch_size, seq_len]
-                
-                # 计算FFT
-                fft_result = torch.fft.rfft(feature, dim=1)  # [batch_size, seq_len//2 + 1]
-                
-                # 提取幅度和相位
-                magnitudes = torch.abs(fft_result)  # [batch_size, seq_len//2 + 1]
-                phases = torch.angle(fft_result)  # [batch_size, seq_len//2 + 1]
-                
-                # 数值稳定性处理
-                magnitudes = torch.clamp(magnitudes, min=1e-8, max=100.0)
-                phases = torch.clamp(phases, min=-np.pi, max=np.pi)
-                
-                # 选择前N个频率分量
-                if magnitudes.size(1) >= self.fft_bins:
-                    selected_magnitudes = magnitudes[:, :self.fft_bins]
-                    selected_phases = phases[:, :self.fft_bins]
-                else:
-                    # 如果序列太短，进行零填充
-                    selected_magnitudes = F.pad(magnitudes, (0, self.fft_bins - magnitudes.size(1)))
-                    selected_phases = F.pad(phases, (0, self.fft_bins - phases.size(1)))
-                
-                # 应用可学习的频率权重
-                freq_weights = F.softmax(self.freq_attention, dim=0)
-                weighted_magnitudes = selected_magnitudes * freq_weights
-                weighted_phases = selected_phases * self.phase_scale
-                
-                # 组合幅度和相位信息
-                combined_features = torch.cat([
-                    weighted_magnitudes * self.magnitude_scale,
-                    weighted_phases
-                ], dim=1)  # [batch_size, fft_bins * 2]
-                
-                fft_features.append(combined_features)
+            # 数值预处理：去均值和窗函数
+            x_processed = x - x.mean(dim=1, keepdim=True)
             
+            # 应用汉宁窗减少频谱泄漏
+            window = torch.hann_window(self.seq_len, device=x.device)
+            x_windowed = x_processed * window.unsqueeze(0).unsqueeze(-1)
+            
+            # 向量化实现：交换维度以对每个变量的seq_len进行FFT
+            x_permuted = x_windowed.permute(0, 2, 1)  # [batch_size, input_dim, seq_len]
+
+            # 批量进行FFT
+            fft_result = torch.fft.rfft(x_permuted, dim=2)  # [batch_size, input_dim, seq_len//2 + 1]
+
+            # 批量提取幅度和相位，添加更好的数值稳定性
+            magnitudes = torch.abs(fft_result)
+            phases = torch.angle(fft_result)
+
+            # 改进的数值稳定性处理
+            magnitudes = torch.clamp(magnitudes, min=1e-8, max=50.0)  # 降低上限
+            phases = torch.clamp(phases, min=-np.pi, max=np.pi)
+
+            # 选择前N个频率分量
+            if magnitudes.size(2) >= self.fft_bins:
+                selected_magnitudes = magnitudes[:, :, :self.fft_bins]
+                selected_phases = phases[:, :, :self.fft_bins]
+            else:
+                # 如果序列太短，进行零填充
+                pad_width = self.fft_bins - magnitudes.size(2)
+                selected_magnitudes = F.pad(magnitudes, (0, pad_width))
+                selected_phases = F.pad(phases, (0, pad_width))
+            
+            # 应用可学习的频率权重
+            freq_weights = F.softmax(self.freq_attention, dim=0).view(1, 1, -1)
+            weighted_magnitudes = selected_magnitudes * freq_weights
+            weighted_phases = selected_phases * torch.clamp(self.phase_scale, 0.01, 1.0)
+
+            # 组合幅度和相位信息
+            combined_features = torch.cat([
+                weighted_magnitudes * torch.clamp(self.magnitude_scale, 0.1, 10.0),
+                weighted_phases
+            ], dim=2)
+
             # 拼接所有变量的FFT特征
-            all_fft_features = torch.cat(fft_features, dim=1)  # [batch_size, input_dim * fft_bins * 2]
-            
+            all_fft_features = combined_features.view(batch_size, -1)
+
             # 最终数值稳定性检查
             if torch.isnan(all_fft_features).any() or torch.isinf(all_fft_features).any():
-                print("警告: FFT特征包含NaN/Inf，使用零向量替代")
-                all_fft_features = torch.zeros_like(all_fft_features)
-            
+                print("警告: FFT特征包含NaN/Inf，使用备用方案")
+                # 使用简单的时域统计特征作为备用
+                mean_features = x.mean(dim=1)  # [batch_size, input_dim]
+                std_features = x.std(dim=1)   # [batch_size, input_dim]
+                backup_features = torch.cat([mean_features, std_features], dim=1)
+                # 扩展到目标维度
+                target_dim = self.input_dim * self.fft_bins * 2
+                if backup_features.size(1) < target_dim:
+                    pad_size = target_dim - backup_features.size(1)
+                    backup_features = F.pad(backup_features, (0, pad_size))
+                else:
+                    backup_features = backup_features[:, :target_dim]
+                return backup_features
+
             return all_fft_features
-            
+
         except Exception as e:
             print(f"FFT特征提取失败: {e}")
-            # 返回零向量作为备用
-            return torch.zeros(batch_size, self.input_dim * self.fft_bins * 2, device=x.device)
+            # 返回时域统计特征作为备用
+            mean_features = x.mean(dim=1)
+            std_features = x.std(dim=1)
+            backup_features = torch.cat([mean_features, std_features], dim=1)
+            target_dim = self.input_dim * self.fft_bins * 2
+            if backup_features.size(1) < target_dim:
+                pad_size = target_dim - backup_features.size(1)
+                backup_features = F.pad(backup_features, (0, pad_size))
+            else:
+                backup_features = backup_features[:, :target_dim]
+            return backup_features
 
 class FrequencyMambaGate(nn.Module):
     """
@@ -171,8 +194,11 @@ class FFTmsMambaExpert(nn.Module):
         # 检查是否有CUDA和mamba-ssm
         self.use_mamba = self._check_mamba_availability()
         
-        for scale in init_scales:
-            if self.use_mamba:
+        # 统一初始化策略
+        if self.use_mamba:
+            # 尝试初始化所有Mamba层
+            mamba_success = True
+            for scale in init_scales:
                 try:
                     from mamba_ssm import Mamba
                     mamba_layer = Mamba(
@@ -185,17 +211,22 @@ class FFTmsMambaExpert(nn.Module):
                     print(f"✅ 成功初始化Mamba层 (scale={scale})")
                 except Exception as e:
                     print(f"❌ Mamba层初始化失败 (scale={scale}): {e}")
-                    self.use_mamba = False
-                    print("切换到LSTM替代方案")
-                    # 重新初始化所有层为LSTM
-                    self.multi_scale_mamba = nn.ModuleList()
-                    for _ in init_scales:
-                        self.multi_scale_mamba.append(
-                            nn.LSTM(self.d_model, self.d_model, batch_first=True)
-                        )
+                    mamba_success = False
                     break
-            else:
-                # 使用LSTM作为替代
+            
+            # 如果有任何Mamba层初始化失败，回退到LSTM
+            if not mamba_success:
+                print("🔄 Mamba初始化失败，切换到LSTM替代方案")
+                self.use_mamba = False
+                self.multi_scale_mamba = nn.ModuleList()
+                for scale in init_scales:
+                    self.multi_scale_mamba.append(
+                        nn.LSTM(self.d_model, self.d_model, batch_first=True)
+                    )
+                    print(f"🔄 使用LSTM替代Mamba (scale={scale})")
+        else:
+            # 直接使用LSTM替代
+            for scale in init_scales:
                 self.multi_scale_mamba.append(
                     nn.LSTM(self.d_model, self.d_model, batch_first=True)
                 )
@@ -316,84 +347,68 @@ class FFTmsMambaExpert(nn.Module):
         if seq_len != self.seq_len:
             raise ValueError(f"序列长度不匹配: 期望{self.seq_len}, 实际{seq_len}")
         
-        # === 1. FrequencyMamba风格的时频域处理 ===
-        # 时域特征提取
-        time_features = self.time_projection(x)  # [B, T, d_model]
+        # 1. 时域和频域特征准备
+        # (batch_size, seq_len, d_model)
+        x_time = self.time_projection(x)
         
-        # 频域特征提取
-        fft_features = self.fft_extractor(x)  # [B, input_dim * fft_bins * 2]
-        freq_features = self.freq_projection(fft_features)  # [B, d_model]
+        # (batch_size, fft_feature_size)
+        x_freq_flat = self.fft_extractor(x)
         
-        # 将频域特征扩展到序列长度
-        freq_features_expanded = freq_features.unsqueeze(1).expand(-1, seq_len, -1)  # [B, T, d_model]
+        # (batch_size, d_model) -> (batch_size, 1, d_model) -> (batch_size, seq_len, d_model)
+        x_freq = self.freq_projection(x_freq_flat).unsqueeze(1).expand(-1, self.seq_len, -1)
         
-        # 时频融合
-        fused_input = torch.cat([time_features, freq_features_expanded], dim=-1)  # [B, T, d_model*2]
-        fused_features = self.time_freq_fusion(fused_input)  # [B, T, d_model]
+        # 2. 时频融合
+        # 使用门控机制融合
+        x_proj = self.freq_gate(x_time, x_freq)
+        x_proj = self.dropout(x_proj)
         
-        # 应用门控机制
-        gated_features = self.freq_gate(time_features, freq_features_expanded)  # [B, T, d_model]
-        
-        # 最终融合
-        final_input = fused_features + gated_features  # [B, T, d_model]
-        
-        # === 2. 多尺度Mamba处理 ===
+        # 3. 多尺度处理
         scale_outputs = []
-        
-        for i, mamba_layer in enumerate(self.multi_scale_mamba):
-            # 使用可学习的delta参数
-            delta = torch.clamp(self.learnable_deltas[i], min=1.0, max=8.0)
-            scale = delta.item()
+        for i, scale_delta in enumerate(self.learnable_deltas):
+            # 使用abs确保尺度为正
+            scale = torch.abs(scale_delta)
             
-            # 获取当前尺度的输入
-            if scale == 1:
-                scaled_input = final_input
-            elif scale > 1:
-                scaled_input = self._downsample(final_input, scale)
-            else:
-                target_len = int(seq_len / scale)
-                scaled_input = self._upsample(final_input, target_len)
+            # 下采样
+            x_proj_scaled = self._downsample(x_proj, scale)
             
-            # 通过Mamba层或LSTM层
+            # Mamba/LSTM处理
+            mamba_layer = self.multi_scale_mamba[i]
+            
             if self.use_mamba:
-                scaled_output = mamba_layer(scaled_input)
+                mamba_out = mamba_layer(x_proj_scaled)
             else:
-                scaled_output, _ = mamba_layer(scaled_input)
+                # 修复：正确处理LSTM输出
+                mamba_out, _ = mamba_layer(x_proj_scaled)
             
-            # 恢复到原始序列长度
-            if scaled_output.size(1) != seq_len:
-                if scaled_output.size(1) < seq_len:
-                    scaled_output = self._upsample(scaled_output, seq_len)
-                else:
-                    scale_factor = scaled_output.size(1) / seq_len
-                    scaled_output = self._downsample(scaled_output, scale_factor)
-            
-            scale_outputs.append(scaled_output)
+            # 上采样
+            x_up = self._upsample(mamba_out, self.seq_len)
+            scale_outputs.append(x_up)
         
-        # === 3. 尺度融合 ===
-        if len(scale_outputs) > 1:
-            multi_scale_features = torch.cat(scale_outputs, dim=-1)  # [B, T, d_model * num_scales]
-            fused_output = self.scale_fusion(multi_scale_features)   # [B, T, d_model]
-        else:
-            fused_output = scale_outputs[0]
+        # 4. 尺度融合
+        x_fused = torch.cat(scale_outputs, dim=-1)
+        x_fused = self.scale_fusion(x_fused)
+        x_fused = self.dropout(x_fused)
         
-        # === 4. 专家个性化 ===
-        personalized_output = self.expert_personalization(fused_output)
-        personalized_output = self.dropout(personalized_output)
+        # 5. 专家个性化
+        x_fused = self.expert_personalization(x_fused)
         
-        # 如果只需要特征，直接返回
+        # 残差连接
+        final_output = x_proj + x_fused
+        
         if return_features:
-            return personalized_output  # [B, T, d_model]
+            return self.output_projection(final_output)
         
-        # === 5. 预测输出 ===
-        output_features = self.output_projection(personalized_output)  # [B, T, output_dim]
+        # 6. 最终预测
+        # (batch_size, seq_len, d_model) -> (batch_size, d_model, seq_len)
+        final_output_permuted = final_output.permute(0, 2, 1)
         
-        # 时序预测
-        output_transposed = output_features.transpose(1, 2)  # [B, output_dim, T]
-        predictions_transposed = self.prediction_head(output_transposed)  # [B, output_dim, pred_len]
-        predictions = predictions_transposed.transpose(1, 2)  # [B, pred_len, output_dim]
+        # (batch_size, d_model, pred_len)
+        prediction = self.prediction_head(final_output_permuted)
         
-        return predictions
+        # (batch_size, pred_len, d_model)
+        prediction = prediction.permute(0, 2, 1)
+        
+        return self.output_projection(prediction)
 
     def _downsample(self, x, scale):
         """下采样到指定尺度"""
@@ -424,14 +439,20 @@ class FFTmsMambaExpert(nn.Module):
         if not MAMBA_AVAILABLE:
             return False
         
+        # Mamba要求CUDA支持
+        if not torch.cuda.is_available():
+            print(f"专家{self.expert_id}: CUDA不可用，Mamba需要CUDA支持，使用LSTM替代")
+            return False
+        
         try:
-            # 测试创建一个小的Mamba层
-            test_mamba = Mamba(d_model=16, d_state=8)
-            test_input = torch.randn(1, 10, 16)
+            # 在CUDA上测试创建一个小的Mamba层
+            test_mamba = Mamba(d_model=16, d_state=8).cuda()
+            test_input = torch.randn(1, 10, 16).cuda()  # 修复：在CUDA上创建测试输入
             _ = test_mamba(test_input)
+            print(f"专家{self.expert_id}: Mamba可用性检查通过")
             return True
         except Exception as e:
-            print(f"Mamba可用性检查失败: {e}")
+            print(f"专家{self.expert_id}: Mamba可用性检查失败: {e}")
             return False
 
     def to(self, device):

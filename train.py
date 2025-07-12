@@ -18,11 +18,11 @@ from typing import Dict, Optional, Tuple
 import argparse
 import json
 
-from m2moep.models.m2_moep import M2_MOEP
-from m2moep.data.universal_dataset import UniversalDataModule
-from m2moep.utils.losses import CompositeLoss
-from m2moep.utils.metrics import calculate_metrics
-from m2moep.configs.config_generator import ConfigGenerator
+from models.m2_moep import M2_MOEP
+from data.universal_dataset import UniversalDataModule
+from utils.losses import CompositeLoss
+from utils.metrics import calculate_metrics
+from configs.config_generator import ConfigGenerator
 
 
 class M2MOEPTrainer:
@@ -59,8 +59,8 @@ class M2MOEPTrainer:
         # 初始化模型
         self.model = M2_MOEP(config).to(self.device)
         
-        # 初始化损失函数
-        self.criterion = CompositeLoss(config)
+        # 🔧 修复：不再使用独立的CompositeLoss，使用模型内置的损失计算
+        # self.criterion = CompositeLoss(config)  # 注释掉
         
         # 初始化优化器
         self.optimizer = optim.Adam(
@@ -216,7 +216,7 @@ class M2MOEPTrainer:
         
         try:
             # 导入预训练函数
-            from m2moep.pretrain_flow import pretrain_flow_model
+            from pretrain_flow import pretrain_flow_model
             success = pretrain_flow_model(self.config, flow_model_path)
             
             if success:
@@ -330,30 +330,39 @@ class M2MOEPTrainer:
                 
                 batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
                 
+                # 检查模型是否有部分组件在CUDA上（如Mamba专家）
+                model_has_cuda_components = any(
+                    hasattr(expert, 'use_mamba') and expert.use_mamba 
+                    for expert in self.model.experts if hasattr(expert, 'use_mamba')
+                )
+                
+                if model_has_cuda_components and torch.cuda.is_available():
+                    # 如果模型有CUDA组件，确保数据也在CUDA上
+                    batch_x, batch_y = batch_x.cuda(), batch_y.cuda()
+                
                 # 前向传播
                 self.optimizer.zero_grad()
                 
                 # 模型预测 - 传递ground_truth用于三元组挖掘
                 output = self.model(batch_x, ground_truth=batch_y, return_aux_info=True)
-                predictions = output['predictions']
-                aux_info = output['aux_info']
+                
+                # 🔧 修复：移除Flow重构代码，模型内部处理
+                # predictions = output['predictions']
+                # aux_info = output['aux_info']
                 
                 # 获取Flow重构（如果可用）
-                reconstructed = None
-                if hasattr(self.data_module, 'get_flow_reconstruction'):
-                    reconstructed = self.data_module.get_flow_reconstruction(batch_x)
-                    if reconstructed is not None and reconstructed.numel() > 0:
-                        reconstructed = reconstructed.to(self.device)
-                        aux_info['original_input'] = batch_x
+                # reconstructed = None
+                # if hasattr(self.data_module, 'get_flow_reconstruction'):
+                #     reconstructed = self.data_module.get_flow_reconstruction(batch_x)
+                #     if reconstructed is not None and reconstructed.numel() > 0:
+                #         reconstructed = reconstructed.to(self.device)
+                #         aux_info['original_input'] = batch_x
                 
                 # 计算损失
-                losses = self.criterion(
-                    predictions=predictions,
+                losses = self.model.compute_loss(
+                    outputs=output,
                     targets=batch_y,
-                    expert_weights=aux_info.get('expert_weights'),
-                    expert_embeddings=aux_info.get('expert_embeddings'),
-                    flow_embeddings=reconstructed,
-                    flow_log_det=aux_info.get('flow_log_det')
+                    epoch=self.current_epoch
                 )
                 total_loss = losses['total']
                 
@@ -383,24 +392,15 @@ class M2MOEPTrainer:
                     self.optimizer.zero_grad()
                     continue
                 
-                # 4. 自适应梯度裁剪 - 🔧 关键修复：先裁剪再统计
+                # 4. 自适应梯度裁剪 - 简化版本
                 clip_value = self.grad_clip_threshold
                 if total_grad_norm > clip_value:
-                    # 计算裁剪因子
-                    clip_factor = clip_value / (total_grad_norm + 1e-6)
-                    
                     # 应用梯度裁剪
-                    for param in self.model.parameters():
-                        if param.grad is not None:
-                            param.grad.data.mul_(clip_factor)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_value)
                     
-                    # 更新裁剪阈值
+                    # 简化阈值调整
                     if total_grad_norm > 10.0:
                         self.grad_clip_threshold = max(0.1, self.grad_clip_threshold * 0.5)
-                    elif total_grad_norm > 5.0:
-                        self.grad_clip_threshold = max(0.1, self.grad_clip_threshold * 0.8)
-                    else:
-                        self.grad_clip_threshold = max(0.1, self.grad_clip_threshold * 0.9)
                     
                     self.logger.warning(f"梯度裁剪: {total_grad_norm:.4f} -> {clip_value:.4f}")
                     self.gradient_stats['grad_clip_count'] += 1
@@ -413,28 +413,25 @@ class M2MOEPTrainer:
                 
                 # 更新温度调度
                 if hasattr(self.model, 'update_temperature_schedule'):
-                    # 修复：确保expert_weights存在且形状正确
-                    if 'expert_weights' in aux_info and aux_info['expert_weights'] is not None:
-                        expert_weights = aux_info['expert_weights']
+                    if 'expert_weights' in output and output['expert_weights'] is not None:
+                        expert_weights = output['expert_weights']
                         if expert_weights.dim() == 2 and expert_weights.size(0) > 0:
-                            expert_usage = expert_weights.mean(dim=0)  # 指定维度
+                            expert_usage = expert_weights.mean(dim=0)
                             expert_entropy = -torch.sum(
                                 expert_usage * torch.log(expert_usage + 1e-8)
                             )
                             self.model.update_temperature_schedule(self.current_epoch, expert_entropy)
                 
-                # 累积损失
+                # 累积损失 - 简化版本
                 for key, loss in losses.items():
-                    if isinstance(loss, torch.Tensor):
-                        epoch_losses[key] += loss.item()
-                    else:
-                        epoch_losses[key] += loss
+                    if key in epoch_losses:
+                        epoch_losses[key] += loss.item() if isinstance(loss, torch.Tensor) else loss
                 
                 # 更新进度条
                 pbar.set_postfix({
                     'Loss': f"{total_loss.item():.4f}",
                     'Pred': f"{losses.get('prediction', 0):.4f}",
-                    'Triplet': f"{aux_info.get('triplet_loss', 0):.4f}",
+                    'Triplet': f"{losses.get('triplet', 0):.4f}",
                     'Temp': f"{self.model.temperature.item():.3f}",
                     'Grad': f"{total_grad_norm:.3f}",
                     'Clip': f"{clip_value:.3f}"
@@ -446,8 +443,16 @@ class M2MOEPTrainer:
         
         return epoch_losses
     
-    def validate_epoch(self) -> Tuple[Dict[str, float], Dict[str, float]]:
-        """验证一个epoch"""
+    def validate_epoch(self, current_epoch: int) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """
+        验证单个epoch
+        
+        Args:
+            current_epoch (int): 当前的训练轮次
+            
+        Returns:
+            验证损失和指标
+        """
         self.model.eval()
         val_loader = self.data_module.get_val_loader()
         
@@ -469,39 +474,46 @@ class M2MOEPTrainer:
             for batch_x, batch_y in val_loader:
                 batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
                 
+                # 检查模型是否有部分组件在CUDA上（如Mamba专家）
+                model_has_cuda_components = any(
+                    hasattr(expert, 'use_mamba') and expert.use_mamba 
+                    for expert in self.model.experts if hasattr(expert, 'use_mamba')
+                )
+                
+                if model_has_cuda_components and torch.cuda.is_available():
+                    # 如果模型有CUDA组件，确保数据也在CUDA上
+                    batch_x, batch_y = batch_x.cuda(), batch_y.cuda()
+                
                 # 验证时不需要三元组挖掘，所以不传递ground_truth
                 output = self.model(batch_x, return_aux_info=True)
-                predictions = output['predictions']
-                aux_info = output['aux_info']
+                
+                # 🔧 修复：移除Flow重构代码，模型内部处理
+                # predictions = output['predictions']
+                # aux_info = output['aux_info']
                 
                 # 获取Flow重构
-                reconstructed = None
-                if hasattr(self.data_module, 'get_flow_reconstruction'):
-                    reconstructed = self.data_module.get_flow_reconstruction(batch_x)
-                    if reconstructed is not None and reconstructed.numel() > 0:
-                        reconstructed = reconstructed.to(self.device)
-                        aux_info['original_input'] = batch_x
+                # reconstructed = None
+                # if hasattr(self.data_module, 'get_flow_reconstruction'):
+                #     reconstructed = self.data_module.get_flow_reconstruction(batch_x)
+                #     if reconstructed is not None and reconstructed.numel() > 0:
+                #         reconstructed = reconstructed.to(self.device)
+                #         aux_info['original_input'] = batch_x
                 
                 # 计算损失
-                losses = self.criterion(
-                    predictions=predictions,
+                losses = self.model.compute_loss(
+                    outputs=output,
                     targets=batch_y,
-                    expert_weights=aux_info.get('expert_weights'),
-                    expert_embeddings=aux_info.get('expert_embeddings'),
-                    flow_embeddings=reconstructed,
-                    flow_log_det=aux_info.get('flow_log_det')
+                    epoch=current_epoch
                 )
                 total_loss = losses['total']
                 
-                # 累积损失
+                # 累积损失 - 简化版本
                 for key, loss in losses.items():
-                    if isinstance(loss, torch.Tensor):
-                        epoch_losses[key] += loss.item()
-                    else:
-                        epoch_losses[key] += loss
+                    if key in epoch_losses:
+                        epoch_losses[key] += loss.item() if isinstance(loss, torch.Tensor) else loss
                 
                 # 收集预测和目标用于计算指标
-                all_predictions.append(predictions.cpu())
+                all_predictions.append(output['predictions'].cpu())
                 all_targets.append(batch_y.cpu())
         
         # 计算平均损失
@@ -513,6 +525,10 @@ class M2MOEPTrainer:
         all_predictions = torch.cat(all_predictions, dim=0)
         all_targets = torch.cat(all_targets, dim=0)
         metrics = calculate_metrics(all_predictions, all_targets)
+        
+        # 更新温度调度
+        if self.config['model'].get('use_temperature_scheduler', False):
+            self.model.update_temperature(total_loss, current_epoch)
         
         return epoch_losses, metrics
     
@@ -570,7 +586,7 @@ class M2MOEPTrainer:
             train_losses = self.train_epoch()
             
             # 验证一个epoch
-            val_losses, val_metrics = self.validate_epoch()
+            val_losses, val_metrics = self.validate_epoch(self.current_epoch)
             
             # 更新学习率
             self.scheduler.step()

@@ -85,11 +85,11 @@ class ConfigGenerator:
             'consistency_temperature': 0.1,
             'aux_loss_weight': 0.01,
             'loss_weights': {
-                'init_sigma_rc': 1.0,
-                'init_sigma_cl': 1.0,
-                'init_sigma_pr': 1.0,
-                'init_sigma_consistency': 1.0,
-                'init_sigma_balance': 1.0
+                'prediction': 1.0,      # 🔧 修复：使用一致的命名
+                'reconstruction': 0.1,  # 🔧 修复：使用一致的命名
+                'triplet': 0.1,         # 🔧 修复：使用一致的命名
+                'prototype_reg': 0.01,  # 🔧 修复：使用一致的命名
+                'load_balance': 0.01    # 🔧 修复：使用一致的命名
             }
         },
         'evaluation': {
@@ -99,12 +99,12 @@ class ConfigGenerator:
         }
     }
     
-    # 数据集特定配置 - 使用正确的路径模式
+    # 数据集特定配置 - 修正实际路径
     DATASET_CONFIGS = {
         'electricity': {
             'description': '321个客户的每小时用电量数据',
             'expected_features': 321,
-            'data_path': 'dataset/electricity_321个客户的每小时用电量/electricity.csv',
+            'data_path': 'dataset/electricity/electricity.csv',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -112,7 +112,7 @@ class ConfigGenerator:
         'traffic': {
             'description': '862个传感器测量的每小时道路占用率',
             'expected_features': 862,
-            'data_path': 'dataset/traffic_862个传感器测量的每小时道路占用率/traffic.csv',
+            'data_path': 'dataset/traffic/traffic.csv',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -120,7 +120,7 @@ class ConfigGenerator:
         'weather': {
             'description': '气象站21个气象因子数据',
             'expected_features': 21,
-            'data_path': 'dataset/weather_气象站_21个气象因子/weather.csv',
+            'data_path': 'dataset/weather/weather.csv',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -128,7 +128,7 @@ class ConfigGenerator:
         'ETTh1': {
             'description': '7个因素的变压器温度变化',
             'expected_features': 7,
-            'data_path': 'dataset/ETT-small_7个因素的变压器温度变化/ETTh1.csv',
+            'data_path': 'dataset/ETT/ETTh1.csv',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -136,7 +136,7 @@ class ConfigGenerator:
         'ETTh2': {
             'description': '7个因素的变压器温度变化',
             'expected_features': 7,
-            'data_path': 'dataset/ETT-small_7个因素的变压器温度变化/ETTh2.csv',
+            'data_path': 'dataset/ETT/ETTh2.csv',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -144,7 +144,7 @@ class ConfigGenerator:
         'ETTm1': {
             'description': '7个因素的变压器温度变化',
             'expected_features': 7,
-            'data_path': 'dataset/ETT-small_7个因素的变压器温度变化/ETTm1.csv',
+            'data_path': 'dataset/ETT/ETTm1.csv',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -152,7 +152,7 @@ class ConfigGenerator:
         'ETTm2': {
             'description': '7个因素的变压器温度变化',
             'expected_features': 7,
-            'data_path': 'dataset/ETT-small_7个因素的变压器温度变化/ETTm2.csv',
+            'data_path': 'dataset/ETT/ETTm2.csv',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -160,7 +160,7 @@ class ConfigGenerator:
         'exchange_rate': {
             'description': '8个国家的汇率变化',
             'expected_features': 8,
-            'data_path': 'dataset/exchange_rate_8个国家的汇率变化/exchange_rate.csv',
+            'data_path': 'dataset/exchange/exchange_rate.csv',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -168,7 +168,7 @@ class ConfigGenerator:
         'illness': {
             'description': '流感患者比例和数量',
             'expected_features': 7,
-            'data_path': 'dataset/illness_流感患者比例和数量/national_illness.csv',
+            'data_path': 'dataset/illness/national_illness.csv',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -176,7 +176,7 @@ class ConfigGenerator:
         'Solar': {
             'description': '137个发电站发电量',
             'expected_features': 137,
-            'data_path': 'dataset/Solar_137个发电站发电量/solar_AL.csv',
+            'data_path': 'dataset/Solar/solar_AL.txt',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -184,7 +184,7 @@ class ConfigGenerator:
         'PEMS': {
             'description': '5分钟窗口收集的公共交通网络数据',
             'expected_features': 307,
-            'data_path': 'dataset/PEMS_5分钟窗口收集的公共交通网络数据/PEMS04.npz',
+            'data_path': 'dataset/PEMS/PEMS04.npz',
             'seq_len': 96,
             'pred_len': 96,
             'scaler_type': 'standard'
@@ -287,6 +287,53 @@ class ConfigGenerator:
             raise ValueError(f"不支持的数据集: {dataset_name}")
         
         return cls.DATASET_CONFIGS[dataset_name].copy()
+
+    @classmethod
+    def validate_config(cls, config: Dict) -> bool:
+        """验证配置的完整性和正确性"""
+        try:
+            # 检查必需的顶级键
+            required_keys = ['model', 'data', 'training']
+            for key in required_keys:
+                if key not in config:
+                    print(f"错误: 缺少必需的配置节: {key}")
+                    return False
+            
+            # 验证模型配置
+            model_config = config['model']
+            required_model_keys = ['input_dim', 'output_dim', 'hidden_dim', 'num_experts']
+            for key in required_model_keys:
+                if key not in model_config or model_config[key] <= 0:
+                    print(f"错误: 模型配置中{key}无效")
+                    return False
+            
+            # 验证数据配置
+            data_config = config['data']
+            if data_config.get('seq_len', 0) <= 0 or data_config.get('pred_len', 0) <= 0:
+                print("错误: 序列长度或预测长度无效")
+                return False
+            
+            # 验证训练配置
+            training_config = config['training']
+            if training_config.get('epochs', 0) <= 0:
+                print("错误: 训练轮数无效")
+                return False
+            
+            if training_config.get('learning_rate', 0) <= 0:
+                print("错误: 学习率无效")
+                return False
+            
+            print("✅ 配置验证通过")
+            return True
+            
+        except Exception as e:
+            print(f"配置验证失败: {e}")
+            return False
+
+    @classmethod
+    def get_config_template(cls) -> Dict:
+        """获取配置模板的深拷贝"""
+        return cls._deep_copy_dict(cls.BASE_CONFIG)
 
 
 def main():

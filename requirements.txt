@@ -9,16 +9,7 @@ seaborn>=0.11.0
 tqdm>=4.62.0
 tensorboard>=2.8.0
 PyYAML>=6.0
-argparse
-logging
-datetime
 glob2
-warnings
-typing
-concurrent.futures
-json
-os
-sys
 
 # Mamba相关依赖（可选）
 # mamba-ssm>=1.0.0

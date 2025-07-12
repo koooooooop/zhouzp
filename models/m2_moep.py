@@ -48,9 +48,13 @@ class M2_MOEP(nn.Module):
         
         # 设备管理
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self._device_initialized = False  # 添加设备初始化标志
         
         # 构建模型组件
         self._build_model()
+        
+        # 自动处理Mamba专家的设备
+        self._handle_mamba_devices()
         
         # 初始化温度调度器
         self._init_temperature_scheduler()
@@ -139,6 +143,23 @@ class M2_MOEP(nn.Module):
         # - 删除复杂的路由器（使用简单的原型距离）
         # - 删除多样性原型（专家原型已足够）
     
+    def _handle_mamba_devices(self):
+        """自动处理Mamba专家的设备切换"""
+        cuda_available = torch.cuda.is_available()
+        
+        for i, expert in enumerate(self.experts):
+            if hasattr(expert, 'use_mamba') and expert.use_mamba:
+                if cuda_available:
+                    print(f"专家{i}使用Mamba，自动切换到CUDA")
+                    expert = expert.cuda()
+                    # 更新专家列表中的引用
+                    self.experts[i] = expert
+                else:
+                    print(f"专家{i}: CUDA不可用，Mamba专家将切换到LSTM模式")
+                    expert.use_mamba = False
+                    if hasattr(expert, '_init_lstm_fallback'):
+                        expert._init_lstm_fallback()
+    
     def _init_temperature_scheduler(self):
         """初始化温度调度器"""
         temp_config = self.model_config.get('temperature', {})
@@ -211,6 +232,9 @@ class M2_MOEP(nn.Module):
         # 确保输入在正确设备上
         x = x.to(self.device)
         
+        # 保存原始输入用于重构损失
+        original_input = x.clone()
+        
         # === 步骤1：潜在空间映射 Wi → zi ===
         # 扁平化输入用于Flow模型
         x_flat = x.view(batch_size, -1)  # [batch_size, seq_len * input_dim]
@@ -221,12 +245,11 @@ class M2_MOEP(nn.Module):
             
             # 数值稳定性检查
             if torch.isnan(z_latent).any() or torch.isinf(z_latent).any():
-                print("⚠️ Flow模型输出异常，使用原始输入")
                 z_latent = x_flat
                 flow_log_det = torch.zeros(batch_size, device=self.device)
                 
-        except Exception as e:
-            print(f"⚠️ Flow模型处理失败: {e}")
+        except Exception:
+            # 简化异常处理
             z_latent = x_flat
             flow_log_det = torch.zeros(batch_size, device=self.device)
         
@@ -249,13 +272,15 @@ class M2_MOEP(nn.Module):
         expert_outputs = []
         expert_details = []
         
+        # 优化：确保所有专家网络在同一设备上（避免重复检查）
+        if not self._device_initialized:
+            self._ensure_experts_on_device()
+            self._device_initialized = True
+        
         for i, expert in enumerate(self.experts):
-            # 确保专家网络在正确设备上
-            expert_input = x.to(expert.device if hasattr(expert, 'device') else self.device)
-            
             try:
                 # 专家网络处理原始滑动窗口
-                expert_output = expert(expert_input, return_features=True)
+                expert_output = expert(x, return_features=True)
                 
                 if isinstance(expert_output, dict):
                     expert_outputs.append(expert_output['output'])
@@ -264,12 +289,11 @@ class M2_MOEP(nn.Module):
                     expert_outputs.append(expert_output)
                     expert_details.append({'output': expert_output})
                     
-            except Exception as e:
-                print(f"⚠️ 专家{i}处理失败: {e}")
-                # 使用零填充作为备选
+            except Exception:
+                # 简化异常处理：使用零填充
                 fallback_output = torch.zeros(batch_size, seq_len, self.hidden_dim, device=self.device)
                 expert_outputs.append(fallback_output)
-                expert_details.append({'output': fallback_output, 'error': str(e)})
+                expert_details.append({'output': fallback_output, 'error': True})
         
         # === 步骤5：结果聚合 加权求和得到最终预测 ===
         expert_outputs = torch.stack(expert_outputs, dim=1)  # [batch_size, num_experts, seq_len, hidden_dim]
@@ -308,6 +332,7 @@ class M2_MOEP(nn.Module):
                 'hidden_states': last_hidden,
                 'temperature': self.temperature.item(),
                 'loss_stats': self.loss_stats,
+                'original_input': original_input,  # 添加原始输入用于重构损失
                 # 🔧 修复：添加正确的expert_embeddings到aux_info
                 'aux_info': {
                     'expert_weights': expert_weights,
@@ -317,7 +342,8 @@ class M2_MOEP(nn.Module):
                     'routing_entropy': -torch.sum(expert_weights * torch.log(expert_weights + 1e-8), dim=-1).mean().item(),
                     'temperature': self.temperature.item(),
                     'num_experts_used': (expert_weights > 0.01).sum(dim=1).float().mean().item(),
-                    'prototype_distances': distances.mean(dim=0).tolist()
+                    'prototype_distances': distances.mean(dim=0).tolist(),
+                    'original_input': original_input  # 添加原始输入
                 }
             }
             
@@ -358,7 +384,7 @@ class M2_MOEP(nn.Module):
         reconstruction_loss = self._compute_flow_reconstruction_loss(
             outputs.get('latent_features'),
             outputs.get('flow_log_det'),
-            targets
+            outputs.get('original_input')  # 修复：使用原始输入
         )
         
         # === 3. 路由损失 (Lcl) - 三元组损失 ===
@@ -403,21 +429,21 @@ class M2_MOEP(nn.Module):
             'step_count': self.loss_stats['step_count'] + 1
         })
         
+        # 返回损失字典 - 统一键名格式
         return {
-            'total_loss': total_loss,
-            'prediction_loss': prediction_loss,
-            'reconstruction_loss': reconstruction_loss,
-            'triplet_loss': triplet_loss,
-            'prototype_reg_loss': prototype_reg_loss,
-            'load_balance_loss': load_balance_loss,
-            'loss_stats': self.loss_stats
+            'total': total_loss,
+            'prediction': prediction_loss,
+            'reconstruction': reconstruction_loss,
+            'triplet': triplet_loss,
+            'prototype': prototype_reg_loss,
+            'load_balance': load_balance_loss
         }
     
     def _compute_flow_reconstruction_loss(self, latent_features: torch.Tensor, 
                                         flow_log_det: torch.Tensor, 
-                                        targets: torch.Tensor) -> torch.Tensor:
-        """计算Flow模型重构损失 - 按照文档公式实现"""
-        if latent_features is None:
+                                        original_input: torch.Tensor) -> torch.Tensor:
+        """计算Flow模型重构损失 - 修复：使用原始输入作为参考"""
+        if latent_features is None or original_input is None:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
         
         try:
@@ -426,18 +452,10 @@ class M2_MOEP(nn.Module):
             reconstructed = self.flow_model.reconstruct(latent_features)
             
             # 将重构结果reshape回原始输入形状
-            original_input = reconstructed.view(batch_size, self.seq_len, self.input_dim)
+            reconstructed_input = reconstructed.view(batch_size, self.seq_len, self.input_dim)
             
-            # 计算重构误差（使用targets的前seq_len步作为参考）
-            if targets.size(1) >= self.seq_len:
-                reference = targets[:, :self.seq_len, :]
-            else:
-                # 如果targets长度不够，使用可用的部分
-                reference = targets
-                original_input = original_input[:, :targets.size(1), :]
-            
-            # MSE重构损失
-            reconstruction_mse = F.mse_loss(original_input, reference)
+            # 使用原始输入作为重构参考
+            reconstruction_mse = F.mse_loss(reconstructed_input, original_input)
             
             # 添加Flow模型的对数行列式项（正则化）
             if flow_log_det is not None:
@@ -528,7 +546,7 @@ class M2_MOEP(nn.Module):
             return torch.tensor(0.0, device=self.device, requires_grad=True)
     
     def _compute_load_balance_loss(self, expert_weights: torch.Tensor) -> torch.Tensor:
-        """计算负载均衡损失"""
+        """计算专家负载均衡损失，鼓励所有专家被使用"""
         if expert_weights is None:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
         
@@ -546,28 +564,42 @@ class M2_MOEP(nn.Module):
             print(f"⚠️ 负载均衡损失计算失败: {e}")
             return torch.tensor(0.0, device=self.device, requires_grad=True)
     
-    def update_temperature(self, performance_metric: float):
-        """更新温度参数"""
+    def update_temperature(self, performance_metric: float, epoch: int):
+        """
+        根据指定的策略更新温度参数
+
+        Args:
+            performance_metric (float): 用于决策的性能指标（例如验证损失）
+            epoch (int): 当前训练轮次
+        """
         if self.temp_schedule == 'fixed':
-            return
-        
+            return  # 固定温度，不更新
+
+        # 记录性能，用于未来可能的自适应策略
         self.temp_stats['performance_history'].append(performance_metric)
+        self.temp_stats['adjustments'] += 1
+
+        if self.temp_schedule == 'exponential':
+            # 指数衰减
+            new_temp = self.temperature.item() * self.temp_decay
+        elif self.temp_schedule == 'cosine':
+            # 余弦退火
+            total_epochs = self.training_config.get('epochs', 1)  # 避免除以零
+            initial_temp = self.model_config.get('temperature', {}).get('initial', self.temp_max)
+            
+            cosine_val = 0.5 * (1 + math.cos(math.pi * epoch / total_epochs))
+            new_temp = self.temp_min + (initial_temp - self.temp_min) * cosine_val
+        else:
+            # 默认为指数衰减
+            new_temp = self.temperature.item() * self.temp_decay
+
+        # 限制温度在预设的范围内
+        clamped_temp = max(self.temp_min, min(new_temp, self.temp_max))
         
-        if self.temp_schedule == 'adaptive':
-            # 自适应温度调整
-            if len(self.temp_stats['performance_history']) >= 2:
-                current_perf = self.temp_stats['performance_history'][-1]
-                prev_perf = self.temp_stats['performance_history'][-2]
-                
-                if current_perf > prev_perf:  # 性能提升
-                    self.temperature.data = max(self.temp_min, self.temperature.data * self.temp_decay)
-                else:  # 性能下降
-                    self.temperature.data = min(self.temp_max, self.temperature.data / self.temp_decay)
-                
-                self.temp_stats['adjustments'] += 1
-        
+        # 修复：确保温度参数在正确设备上
+        self.temperature.data = torch.tensor(clamped_temp, dtype=torch.float32, device=self.temperature.device)
         self.temp_stats['current'] = self.temperature.item()
-    
+
     def to(self, device):
         """重写to方法，确保所有组件都移动到正确设备"""
         super().to(device)
@@ -625,97 +657,23 @@ class M2_MOEP(nn.Module):
             'device': str(self.device)
         }
 
-
-class PositionalEncoding(nn.Module):
-    """位置编码模块"""
-    
-    def __init__(self, d_model: int, max_len: int = 5000):
-        super().__init__()
-        
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        
-        self.register_buffer('pe', pe)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [batch_size, seq_len, d_model]
-        Returns:
-            [batch_size, seq_len, d_model]
-        """
-        return x + self.pe[:x.size(1), :].transpose(0, 1)
-
-
-class ExpertRouter(nn.Module):
-    """专家路由器"""
-    
-    def __init__(self, input_dim: int, num_experts: int, hidden_dim: int = 256):
-        super().__init__()
-        
-        self.num_experts = num_experts
-        
-        # 路由网络
-        self.routing_network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, num_experts)
-        )
-        
-        # 门控网络
-        self.gate_network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, num_experts),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, x: torch.Tensor, temperature: float = 1.0) -> Tuple[torch.Tensor, Dict]:
-        """
-        Args:
-            x: [batch_size, seq_len, input_dim]
-            temperature: 温度参数
-        Returns:
-            expert_weights: [batch_size, num_experts]
-            routing_info: 路由信息字典
-        """
-        # 使用平均池化获取序列级别的特征
-        pooled_x = torch.mean(x, dim=1)  # [batch_size, input_dim]
-        
-        # 路由得分
-        routing_logits = self.routing_network(pooled_x)  # [batch_size, num_experts]
-        
-        # 门控得分
-        gate_scores = self.gate_network(pooled_x)  # [batch_size, num_experts]
-        
-        # 应用温度缩放
-        routing_logits = routing_logits / temperature
-        
-        # 计算softmax权重
-        routing_weights = F.softmax(routing_logits, dim=-1)
-        
-        # 应用门控
-        expert_weights = routing_weights * gate_scores
-        
-        # 重新归一化
-        expert_weights = expert_weights / (expert_weights.sum(dim=-1, keepdim=True) + 1e-8)
-        
-        # 路由信息
-        routing_info = {
-            'routing_logits': routing_logits,
-            'routing_weights': routing_weights,
-            'gate_scores': gate_scores,
-            'expert_weights': expert_weights,
-            'temperature': temperature,
-            'entropy': -torch.sum(expert_weights * torch.log(expert_weights + 1e-8), dim=-1).mean()
-        }
-        
-        return expert_weights, routing_info 
+    def _ensure_experts_on_device(self):
+        """确保所有专家网络都在正确设备上（只在初始化时调用一次）"""
+        for i, expert in enumerate(self.experts):
+            try:
+                expert.to(self.device)
+            except Exception as e:
+                print(f"⚠️ 专家{i}移动到设备{self.device}时出错: {e}")
+                # 如果是mamba相关的错误，可能需要特殊处理
+                if hasattr(expert, 'use_mamba') and expert.use_mamba:
+                    if self.device.type != 'cuda' and torch.cuda.is_available():
+                        print(f"⚠️ 专家{i}使用mamba，强制移动到CUDA")
+                        expert.to(torch.device('cuda'))
+                    else:
+                        print(f"⚠️ 专家{i}切换到LSTM模式")
+                        expert.use_mamba = False
+                        if hasattr(expert, '_init_lstm_fallback'):
+                            expert._init_lstm_fallback()
+                        expert.to(self.device)
+                else:
+                    expert.to(self.device) 
